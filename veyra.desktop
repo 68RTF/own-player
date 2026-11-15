@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Свой плеер
+Name=Veyra
 Comment=Локальный музыкальный плеер
-Exec=own-player
-Icon=own-player
+Exec=veyra
+Icon=veyra
 Terminal=false
 Categories=AudioVideo;Audio;Music;Player;
 StartupNotify=true

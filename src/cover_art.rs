@@ -83,7 +83,7 @@ pub(crate) fn online_cover(track: &Track) -> Option<PathBuf> {
             "--max-time",
             "10",
             "--user-agent",
-            "OwnPlayer/0.4",
+            "Veyra/0.7",
         ])
         .arg(format!("https://api.music.yandex.net/albums/{album_id}"))
         .output()
@@ -108,7 +108,7 @@ pub(crate) fn online_cover(track: &Track) -> Option<PathBuf> {
             "--max-filesize",
             "2000000",
             "--user-agent",
-            "OwnPlayer/0.4",
+            "Veyra/0.7",
         ])
         .arg(url)
         .output()

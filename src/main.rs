@@ -119,7 +119,7 @@ fn build_ui(app: &gtk::Application) {
     }));
     restore_session(&model);
     let window = gtk::ApplicationWindow::new(app);
-    window.set_title("Свой плеер");
+    window.set_title("Veyra");
     window.set_default_size(1160, 780);
     window.set_size_request(760, 480);
     window.set_position(gtk::WindowPosition::Center);

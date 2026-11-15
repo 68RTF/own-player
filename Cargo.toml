@@ -1,11 +1,11 @@
 [package]
-name = "own-player"
-version = "0.6.1"
+name = "veyra"
+version = "0.7.0"
 edition = "2021"
-default-run = "own-player"
+default-run = "veyra"
 
 [[bin]]
-name = "own-player"
+name = "veyra"
 path = "src/main.rs"
 
 [[bin]]

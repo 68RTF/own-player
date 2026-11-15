@@ -9,9 +9,9 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cp packaging/arch/PKGBUILD "$work/PKGBUILD"
-tar -czf "$work/own-player-${version}.tar.gz" \
-  --transform="s,^,own-player-${version}/," \
-  Cargo.toml Cargo.lock own-player.desktop assets src
+tar -czf "$work/veyra-${version}.tar.gz" \
+  --transform="s,^,veyra-${version}/," \
+  Cargo.toml Cargo.lock veyra.desktop assets src
 mkdir -p dist
 export PKGDEST="$(pwd)/dist"
 (

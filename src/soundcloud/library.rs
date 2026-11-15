@@ -286,7 +286,7 @@ pub(super) fn write_skipped_report(dir: &Path, entries: &[SkippedEntry]) -> Opti
             .then(left.title.to_lowercase().cmp(&right.title.to_lowercase()))
     });
     let mut text = String::from(
-        "Свой плеер — пропущенные треки SoundCloud\n\
+        "Veyra — пропущенные треки SoundCloud\n\
          Скачиваются только треки, которые авторы разрешили скачивать.\n\n",
     );
     for entry in &sorted {

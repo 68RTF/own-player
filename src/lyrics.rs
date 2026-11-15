@@ -71,7 +71,7 @@ fn request(endpoint: &str, params: &[(&str, &str)]) -> Result<Option<Value>, Str
         "--max-time",
         "12",
         "--user-agent",
-        "OwnPlayer/0.3",
+        "Veyra/0.7",
         "--get",
     ]);
     for (name, value) in params {

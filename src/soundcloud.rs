@@ -33,7 +33,7 @@ pub(crate) use files::default_download_dir;
 
 const API_DEFAULT: &str = "https://api-v2.soundcloud.com";
 const WEB_DEFAULT: &str = "https://soundcloud.com";
-const USER_AGENT: &str = "OwnPlayer/0.6 (local SoundCloud download)";
+const USER_AGENT: &str = "Veyra/0.7 (local SoundCloud download)";
 const TOKEN_SERVICE: &str = "own-player";
 const TOKEN_KIND: &str = "soundcloud-token";
 const MAX_JSON: u64 = 8 * 1024 * 1024;
