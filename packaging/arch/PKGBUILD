@@ -1,0 +1,34 @@
+# Maintainer: 68RTF
+pkgname=own-player
+pkgver=0.6.1
+pkgrel=1
+pkgdesc='Local GTK music player powered by mpv'
+arch=('x86_64' 'aarch64')
+url='https://github.com/68RTF/own-player'
+depends=('gtk3' 'mpv' 'ffmpeg' 'curl')
+optdepends=('libsecret: save SoundCloud token in the keyring')
+makedepends=('cargo' 'pkgconf')
+options=('!debug')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  export CARGO_HOME="${srcdir}/cargo-home"
+  cargo fetch --locked
+}
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+  cargo build --release --locked --bins
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  install -Dm755 "${srcdir}/target/release/own-player" "${pkgdir}/usr/bin/own-player"
+  install -Dm755 "${srcdir}/target/release/ym-export" "${pkgdir}/usr/bin/ym-export"
+  install -Dm644 own-player.desktop "${pkgdir}/usr/share/applications/own-player.desktop"
+  install -Dm644 assets/own-player.svg "${pkgdir}/usr/share/icons/hicolor/scalable/apps/own-player.svg"
+}

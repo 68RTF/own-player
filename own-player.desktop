@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Свой плеер
+Comment=Локальный музыкальный плеер
+Exec=own-player
+Icon=own-player
+Terminal=false
+Categories=AudioVideo;Audio;Music;Player;
+StartupNotify=true

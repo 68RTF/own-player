@@ -1,0 +1,10 @@
+/target/
+/dist/
+/backups/
+/artifacts/
+/playlist.csv
+*.pkg.tar.*
+*.deb
+*.part
+*.log
+*~

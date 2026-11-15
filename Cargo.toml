@@ -1,0 +1,20 @@
+[package]
+name = "own-player"
+version = "0.6.1"
+edition = "2021"
+default-run = "own-player"
+
+[[bin]]
+name = "own-player"
+path = "src/main.rs"
+
+[[bin]]
+name = "ym-export"
+path = "src/bin/ym-export.rs"
+
+[dependencies]
+gtk = "0.18.2"
+glib = "0.18.5"
+libc = "0.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

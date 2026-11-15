@@ -1,0 +1,431 @@
+/* Shared Material 3 components. Color roles come from the active GTK scheme. */
+window {
+    background-color: @md_surface;
+    color: @md_on_surface;
+    font-family: Roboto, "Noto Sans", sans-serif;
+    font-size: 14px;
+    transition: background-color 180ms ease-out, color 180ms ease-out;
+}
+
+label { color: inherit; }
+selection { background-color: @md_secondary_container; color: @md_on_secondary_container; }
+button {
+    background-image: none;
+    background-color: transparent;
+    border: 1px solid @md_outline;
+    border-radius: 999px;
+    box-shadow: none;
+    text-shadow: none;
+    min-height: 20px;
+    padding: 9px 19px;
+    color: @md_primary;
+    font-weight: 500;
+    transition: background-color 180ms ease-out, color 180ms ease-out, border-color 180ms ease-out;
+}
+button:hover { background-color: alpha(@md_primary, 0.08); }
+button:active { background-color: alpha(@md_primary, 0.12); }
+button:disabled {
+    border-color: alpha(@md_on_surface, 0.12);
+    color: alpha(@md_on_surface, 0.38);
+    background-color: transparent;
+}
+button:focus, entry:focus, scale:focus, switch:focus,
+checkbutton:focus, row:focus, menuitem:focus {
+    outline: 2px solid @md_primary;
+    outline-offset: -2px;
+}
+button.default, .tonal-button, .queue-toolbar > button.queue-add:not(.queue-menu), .play-fab {
+    background-color: @md_primary;
+    border-color: transparent;
+    color: @md_on_primary;
+}
+button.default:hover, .tonal-button:hover,
+.queue-toolbar > button.queue-add:not(.queue-menu):hover, .play-fab:hover {
+    background-color: mix(@md_primary, @md_on_primary, 0.08);
+}
+button.default:active, .tonal-button:active,
+.queue-toolbar > button.queue-add:not(.queue-menu):active, .play-fab:active {
+    background-color: mix(@md_primary, @md_on_primary, 0.12);
+}
+button.default:focus, .tonal-button:focus,
+.queue-toolbar > button.queue-add:not(.queue-menu):focus, .play-fab:focus {
+    outline-color: @md_on_primary;
+    outline-offset: -4px;
+}
+button.default:disabled, .tonal-button:disabled,
+.queue-toolbar > button.queue-add:not(.queue-menu):disabled, .play-fab:disabled {
+    background-color: alpha(@md_on_surface, 0.12);
+    color: alpha(@md_on_surface, 0.38);
+}
+.ghost-button, .dialog-action-area button { border-color: transparent; }
+
+.sidebar {
+    background-color: @md_surface_low;
+    border: none;
+    border-radius: 24px;
+    padding: 12px 8px;
+    transition: background-color 180ms ease-out;
+}
+.brand-mark { background-color: @md_primary_container; border-radius: 12px; }
+.brand-icon { color: @md_on_primary_container; }
+.nav-item, .sidebar-action {
+    padding: 0;
+    min-width: 48px;
+    min-height: 56px;
+    border: none;
+    color: @md_on_surface_variant;
+}
+.nav-item { font-size: 12px; }
+.sidebar button:hover, .sidebar button:active { background-color: transparent; }
+.rail-indicator {
+    border-radius: 999px;
+    transition: background-color 180ms ease-out, color 180ms ease-out;
+}
+.nav-item:hover .rail-indicator, .sidebar-action:hover .rail-indicator,
+.icon-button:hover, .transport-button:hover, .queue-menu:hover {
+    background-color: alpha(@md_on_surface, 0.08);
+}
+.nav-item:active .rail-indicator, .sidebar-action:active .rail-indicator,
+.icon-button:active, .transport-button:active, .queue-menu:active {
+    background-color: alpha(@md_on_surface, 0.12);
+}
+.sidebar-action.selected .rail-indicator, .nav-item.selected .rail-indicator, .transport-button:checked, .transport-button.active,
+.lyrics-action, .speed-preset:checked {
+    background-color: @md_secondary_container;
+    color: @md_on_secondary_container;
+    border-color: transparent;
+}
+.sidebar-action.selected:hover .rail-indicator, .nav-item.selected:hover .rail-indicator, .transport-button:checked:hover, .transport-button.active:hover,
+.lyrics-action:hover, .speed-preset:checked:hover {
+    background-color: mix(@md_secondary_container, @md_on_secondary_container, 0.08);
+}
+.sidebar-action.selected:active .rail-indicator, .nav-item.selected:active .rail-indicator, .transport-button:checked:active, .transport-button.active:active,
+.lyrics-action:active, .speed-preset:checked:active {
+    background-color: mix(@md_secondary_container, @md_on_secondary_container, 0.12);
+}
+.nav-item.selected label { color: @md_on_surface; font-weight: 700; }
+.divider, separator { background-color: @md_outline_variant; }
+
+.heading { font-size: 28px; font-weight: 400; }
+.secondary { color: @md_on_surface_variant; }
+.player-stage {
+    background-color: @md_surface_low;
+    border-radius: 28px;
+    transition: background-color 180ms ease-out;
+}
+.cover-frame {
+    background-color: @md_primary_container;
+    border-radius: 24px;
+    transition: background-color 180ms ease-out;
+    box-shadow: 0 4px 12px alpha(black, 0.18);
+}
+.cover-placeholder { background-color: @md_primary_container; border-radius: 24px; }
+.cover-glyph { color: @md_on_primary_container; }
+.mini-cover-frame, .mini-cover-frame .cover-placeholder,
+.queue-cover, .queue-cover .cover-placeholder { border-radius: 8px; }
+.track-title { font-size: 36px; font-weight: 400; }
+.track-artist { font-size: 20px; color: @md_on_surface_variant; }
+.track-album { color: @md_on_surface_variant; }
+.icon-button, .transport-button, .queue-menu {
+    min-width: 46px;
+    min-height: 46px;
+    padding: 0;
+    border-color: transparent;
+    color: @md_on_surface_variant;
+}
+.icon-button.lyrics-back {
+    min-width: 44px;
+    min-height: 44px;
+    border: none;
+    border-radius: 22px;
+}
+/* GTK 3 draws the focus outline separately from the button border. */
+.lyrics-back:focus { -gtk-outline-radius: 22px; }
+.lyrics-action:focus { -gtk-outline-radius: 999px; }
+.play-fab {
+    min-width: 62px;
+    min-height: 54px;
+    padding: 0;
+    border-radius: 28px;
+    transition: border-radius 180ms ease-out, background-color 180ms ease-out, color 180ms ease-out;
+}
+.transport-indicator {
+    border-radius: 999px;
+    background-color: transparent;
+    transition: background-color 180ms ease-out;
+}
+.transport-button:checked .transport-indicator,
+.transport-button.active .transport-indicator { background-color: @md_on_secondary_container; }
+.transport-button:disabled .transport-indicator { background-color: transparent; }
+.transport-button:disabled:checked, .transport-button.active:disabled {
+    background-color: alpha(@md_on_surface, 0.12);
+    color: alpha(@md_on_surface, 0.38);
+}
+.play-fab.playing { border-radius: 16px; }
+.icon-button:disabled, .transport-button:disabled, .queue-menu:disabled {
+    color: alpha(@md_on_surface, 0.38);
+}
+
+.lyrics-backdrop {
+    background-color: @md_surface_low;
+    border-radius: 28px;
+    transition: background-color 180ms ease-out;
+}
+.lyrics-scrim {
+    background-image: linear-gradient(to bottom, alpha(@md_surface_low, 0.94),
+        alpha(@md_surface_low, 0.88) 55%, alpha(@md_surface_low, 0.92));
+    border-radius: 28px;
+}
+.lyrics-title { font-size: 18px; font-weight: 500; }
+.lyrics-artist, .lyrics-hint { color: @md_on_surface_variant; font-size: 12px; }
+.lyrics-list, .lyrics-list row, .lyrics-scroll, .lyrics-scroll viewport {
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+}
+.lyrics-list .lyric-row {
+    border-radius: 12px;
+    transition: background-color 180ms ease-out;
+}
+.lyrics-list .lyric-row:hover { background-color: alpha(@md_on_surface, 0.08); }
+.lyrics-list .lyric-row.active { background-color: alpha(@md_primary, 0.12); }
+.lyrics-list .lyric-row.active:hover { background-color: alpha(@md_primary, 0.18); }
+.lyric-text {
+    font-size: 28px;
+    font-weight: 600;
+    color: @md_on_surface_variant;
+    transition: color 180ms ease-out;
+}
+.lyric-row.past .lyric-text { color: mix(@md_on_surface_variant, @md_surface_low, 0.18); }
+.lyric-row.active .lyric-text { color: @md_on_surface; transition-duration: 180ms; }
+.lyric-plain { font-size: 18px; font-weight: 400; }
+.lyrics-resume {
+    font-size: 12px;
+    color: @md_on_secondary_container;
+    background-color: @md_secondary_container;
+    border-color: transparent;
+}
+.lyrics-resume:hover { background-color: mix(@md_secondary_container, @md_on_secondary_container, 0.08); }
+.empty-glyph { color: @md_primary; }
+.empty-state { color: @md_on_surface_variant; font-size: 16px; }
+.empty-title { font-size: 22px; font-weight: 400; }
+
+entry {
+    background-image: none;
+    background-color: @md_surface;
+    border: 1px solid @md_outline;
+    border-radius: 4px;
+    padding: 11px 15px;
+    color: @md_on_surface;
+    caret-color: @md_primary;
+    box-shadow: none;
+}
+entry:focus { border-color: @md_primary; outline-offset: -1px; }
+entry placeholder, entry image { color: @md_on_surface_variant; }
+entry.search {
+    background-color: @md_surface_high;
+    border-color: transparent;
+    border-radius: 999px;
+}
+
+.player-bar {
+    background-color: @md_surface_container;
+    border: 1px solid alpha(@md_outline, 0.22);
+    border-radius: 24px;
+    padding: 8px 16px 8px;
+    box-shadow: 0 2px 6px alpha(black, 0.12);
+    transition: background-color 200ms ease-out;
+}
+.transport {
+    background-color: @md_surface_high;
+    border-radius: 32px;
+    padding: 4px;
+    transition: background-color 200ms ease-out;
+}
+.now-playing { padding: 0 4px; }
+.volume-group {
+    background-color: @md_surface_high;
+    border-radius: 999px;
+    padding: 4px 12px;
+}
+.timeline { padding: 0 4px; }
+.timeline scale trough, .timeline scale highlight { min-height: 6px; }
+.timecode, .queue-index, .queue-duration, .speed-value { font-feature-settings: "tnum"; }
+.timecode { color: @md_on_surface_variant; font-size: 12px; min-width: 40px; }
+.now-title { font-size: 16px; font-weight: 500; }
+.now-artist { font-size: 12px; color: @md_on_surface_variant; }
+.muted-icon { color: @md_on_surface_variant; }
+scale { color: @md_primary; }
+scale trough, scale highlight, scale slider {
+    background-image: none;
+    border: none;
+    border-radius: 999px;
+    box-shadow: none;
+    transition: background-color 150ms ease-out, box-shadow 150ms ease-out;
+}
+scale trough { min-height: 4px; background-color: @md_secondary_container; }
+scale highlight, scale slider { background-color: @md_primary; }
+scale slider { min-width: 14px; min-height: 14px; }
+scale slider:hover { box-shadow: 0 0 0 4px alpha(@md_primary, 0.12); }
+scale slider:active { box-shadow: 0 0 0 6px alpha(@md_primary, 0.16); }
+scale:disabled highlight, scale:disabled slider { background-color: alpha(@md_on_surface, 0.38); }
+scale value { color: @md_on_surface_variant; }
+scrollbar, scrollbar trough { background: transparent; border: none; }
+scrollbar slider { min-width: 6px; min-height: 32px; background: @md_outline_variant; border: none; border-radius: 999px; }
+scrollbar slider:hover { background-color: @md_outline; }
+
+.queue-table {
+    background-color: @md_surface_low;
+    border-radius: 20px;
+    transition: background-color 180ms ease-out;
+}
+.queue-columns {
+    background-color: @md_surface_container;
+    border-radius: 20px 20px 0 0;
+    padding: 8px 20px;
+    color: @md_on_surface_variant;
+    font-size: 12px;
+    font-weight: 500;
+    transition: background-color 180ms ease-out, color 180ms ease-out;
+}
+.queue-list, .queue-card, .queue-card viewport { background-color: transparent; }
+.queue-list { padding: 4px 8px; }
+.queue-row {
+    background-color: transparent;
+    color: @md_on_surface;
+    border-radius: 12px;
+    transition: background-color 150ms ease-out;
+}
+.queue-row:hover { background-color: alpha(@md_on_surface, 0.08); }
+.queue-row:selected { background-color: @md_surface_high; }
+.queue-row:selected:hover { background-color: mix(@md_surface_high, @md_on_surface, 0.08); }
+.queue-row.playing { background-color: @md_secondary_container; color: @md_on_secondary_container; }
+.queue-row.playing:hover { background-color: mix(@md_secondary_container, @md_on_secondary_container, 0.08); }
+.queue-row.playing:selected { box-shadow: inset 0 0 0 1px @md_outline; }
+.queue-row:active, .queue-row:selected:active { background-color: mix(@md_surface_high, @md_on_surface, 0.12); }
+.queue-row.playing:active { background-color: mix(@md_secondary_container, @md_on_secondary_container, 0.12); }
+.queue-row:focus { -gtk-outline-radius: 12px; }
+.queue-row.playing .queue-index, .queue-row.playing .queue-artist,
+.queue-row.playing .queue-duration, .queue-row.playing .queue-menu,
+.queue-row.playing .queue-handle { color: @md_on_secondary_container; }
+.queue-index, .queue-duration, .queue-artist, .queue-summary {
+    color: @md_on_surface_variant;
+    font-size: 12px;
+}
+.queue-index { min-width: 32px; }
+.queue-duration { min-width: 48px; }
+.queue-title { font-size: 16px; font-weight: 500; }
+.queue-handle { color: @md_on_surface_variant; padding: 8px 4px; }
+.queue-handle:hover, .queued-next .queue-artist { color: @md_primary; }
+.queue-row:drop(active) { box-shadow: inset 0 0 0 2px @md_primary; }
+.queue-add { min-width: 46px; min-height: 46px; padding: 0; }
+.queue-menu.queue-add { background-color: @md_surface_high; }
+.queue-menu.queue-add:hover, .queue-menu.queue-add:checked {
+    background-color: mix(@md_surface_high, @md_on_surface, 0.08);
+}
+menu {
+    background-color: @md_surface_high;
+    color: @md_on_surface;
+    border: 1px solid @md_outline_variant;
+    border-radius: 8px;
+    padding: 4px 0;
+}
+menuitem { padding: 8px 12px; }
+menuitem:hover { background-color: alpha(@md_on_surface, 0.08); color: @md_on_surface; }
+menuitem:disabled { color: alpha(@md_on_surface, 0.38); }
+tooltip {
+    background-color: @md_inverse_surface;
+    color: @md_inverse_on_surface;
+    border: none;
+    border-radius: 4px;
+}
+tooltip label { color: @md_inverse_on_surface; }
+
+.settings-dialog, messagedialog, filechooserdialog { background-color: @md_surface_high; }
+.settings-dialog .dialog-vbox, messagedialog .dialog-vbox { background-color: transparent; }
+.settings-card { background-color: @md_surface_low; border-radius: 16px; padding: 16px; }
+.settings-label { font-size: 16px; font-weight: 500; }
+.settings-note { font-size: 13px; color: @md_on_surface_variant; }
+.settings-page, .settings-page viewport {
+    background-color: @md_surface_low;
+    border-radius: 28px;
+    transition: background-color 180ms ease-out;
+}
+.settings-section-title { color: @md_primary; font-size: 14px; font-weight: 600; padding-left: 4px; }
+.settings-section {
+    background-color: @md_surface_container;
+    border-radius: 16px;
+    transition: background-color 180ms ease-out;
+}
+.settings-section separator { margin: 0 16px; }
+.settings-row { padding: 12px 16px; }
+.settings-speed { padding: 12px 16px; }
+.settings-info { padding: 0 4px; color: @md_primary; }
+.settings-note.error { color: @md_error; }
+.speed-value {
+    background-color: @md_secondary_container;
+    color: @md_on_secondary_container;
+    border-radius: 999px;
+    padding: 4px 12px;
+    min-width: 48px;
+    font-size: 13px;
+    font-weight: 500;
+}
+.settings-speed-slider { padding: 8px 0; }
+.settings-speed-slider trough, .settings-speed-slider highlight { min-height: 6px; }
+.speed-segments {
+    border: 1px solid @md_outline_variant;
+    border-radius: 999px;
+}
+.speed-preset {
+    padding: 4px 8px;
+    min-height: 28px;
+    border: none;
+    border-right: 1px solid alpha(@md_on_surface, 0.12);
+    border-radius: 0;
+    color: @md_on_surface_variant;
+}
+.speed-preset:first-child { border-radius: 999px 0 0 999px; }
+.speed-preset:last-child { border-radius: 0 999px 999px 0; border-right: none; }
+.speed-segments .speed-preset:checked {
+    font-weight: 700;
+    border-right-color: alpha(@md_on_surface, 0.12);
+}
+.speed-segments .speed-preset:last-child { border-right: none; }
+.settings-page switch {
+    background: @md_surface_high;
+    border: 2px solid @md_outline;
+    border-radius: 999px;
+    min-width: 40px;
+    min-height: 22px;
+    transition: background-color 180ms ease-out, border-color 180ms ease-out;
+}
+.settings-page switch:hover { background-color: mix(@md_surface_high, @md_on_surface, 0.08); }
+.settings-page switch:checked { background: @md_primary; border-color: @md_primary; }
+.settings-page switch:checked:hover { background-color: mix(@md_primary, @md_on_primary, 0.08); }
+.settings-page switch slider {
+    background: @md_outline;
+    border: none;
+    border-radius: 999px;
+    box-shadow: none;
+    min-width: 16px;
+    min-height: 16px;
+    margin: 3px;
+    transition: background-color 180ms ease-out;
+}
+.settings-page switch:checked slider { background: @md_on_primary; }
+.settings-page switch image { color: transparent; }
+.settings-page switch:disabled { opacity: 0.38; }
+checkbutton check {
+    background: @md_surface;
+    border: 2px solid @md_on_surface_variant;
+    border-radius: 3px;
+    color: @md_on_primary;
+}
+checkbutton check:checked { background: @md_primary; border-color: @md_primary; }
+.download-status.error { color: @md_error; }
+progressbar trough, progressbar progress { background-image: none; border: none; border-radius: 999px; min-height: 4px; }
+progressbar trough { background-color: @md_secondary_container; }
+progressbar progress { background-color: @md_primary; }
+progressbar text { color: @md_on_surface_variant; }
