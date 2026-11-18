@@ -4,6 +4,7 @@ cd "$(dirname "$0")/.."
 fixture=$(mktemp -d /tmp/own-player-ui.XXXXXX)
 trap 'rm -rf "$fixture"' EXIT
 export GDK_BACKEND=x11
+export GTK_THEME="${GTK_THEME:-Adwaita:dark}"
 export XDG_DATA_HOME="$fixture/data"
 export XDG_CACHE_HOME="$fixture/cache"
 export OWN_PLAYER_SCREENSHOTS="${OWN_PLAYER_SCREENSHOTS:-$(pwd)/artifacts/ui}"
@@ -20,16 +21,6 @@ print(json.dumps(result if sys.argv[-1].endswith('/get') else [result]))
 print('200', end='')
 PYHTTP
 chmod +x "$fixture/bin/curl"
-# A deliberately slow keyring makes the responsiveness check deterministic.
-cat > "$fixture/bin/secret-tool" <<'KEYRING'
-#!/usr/bin/env bash
-if [[ ${1:-} == lookup ]]; then
-    sleep 0.9
-    exit 1
-fi
-exit 0
-KEYRING
-chmod +x "$fixture/bin/secret-tool"
 export PATH="$fixture/bin:$PATH"
 ffmpeg -v error -f lavfi -i anullsrc=r=8000:cl=mono -t 20 \
   -metadata title='Там, где тихо' -metadata artist='Северный берег' -metadata album='Комната с видом' "$fixture/track.wav"
@@ -52,4 +43,4 @@ for name in ['Тихий океан - Медленный свет', 'Втора�
     tracks.append(str(path))
 (root / 'data/own-player/session.json').write_text(json.dumps(dict(paths=tracks, current_path=track, shuffle=False, repeat=0, online_covers=False, volume=0, speed=1)))
 PY
-xvfb-run -e "$fixture/xvfb.log" -a -s '-screen 0 1160x780x24' cargo test --offline gtk_smoke -- --ignored --test-threads=1 --nocapture
+xvfb-run -e "$fixture/xvfb.log" -a -s "-screen 0 ${OWN_PLAYER_XVFB_SCREEN:-1920x1080x24}" cargo test --offline gtk_smoke -- --ignored --test-threads=1 --nocapture

@@ -2,6 +2,7 @@ use super::*;
 
 fn test_model() -> Rc<RefCell<Model>> {
     Rc::new(RefCell::new(Model {
+        updates: Rc::default(),
         tracks: vec![
             preview_track("/fixture/first.mp3".into()),
             preview_track("/fixture/second.mp3".into()),
@@ -21,8 +22,9 @@ fn test_model() -> Rc<RefCell<Model>> {
         repeat: 2,
         online_covers: false,
         volume: 0.0,
+        muted: false,
+        appearance: Appearance::default(),
         speed: 1.0,
-        soundcloud_dir: PathBuf::from("/tmp/own-player-test-downloads"),
         status: None,
         imports_pending: 0,
         failed_tracks: Default::default(),
@@ -127,16 +129,33 @@ fn gtk_smoke() {
             assert!(status.success());
         }
     };
-    let primary = || window.style_context().lookup_color("md_primary").unwrap();
-    let artwork_primary = primary();
+    let stage_color = || window.style_context().lookup_color("md_stage").unwrap();
+    let artwork_stage = stage_color();
     theme::set_cover(None);
-    assert_ne!(artwork_primary, primary(), "artwork must tint the theme");
+    assert_ne!(artwork_stage, stage_color(), "artwork must tint the stage");
     let artwork = read_saved_session().unwrap().paths[0].with_file_name("cover.png");
     theme::set_cover(Some(&artwork));
-    assert_eq!(artwork_primary, primary());
+    assert_eq!(artwork_stage, stage_color());
     pump(240);
     capture("player");
     let widgets = descendants(window.upcast_ref());
+    for (label, tooltip) in [
+        ("Файлы", "Добавить файлы"),
+        ("Папка", "Добавить папку"),
+        ("Настройки", "Настройки"),
+    ] {
+        let button = widgets
+            .iter()
+            .find(|widget| {
+                widget.style_context().has_class("sidebar-action")
+                    && widget.tooltip_text().as_deref() == Some(tooltip)
+            })
+            .unwrap();
+        assert!(descendants(button)
+            .iter()
+            .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+            .any(|text| text.is_mapped() && text.text() == label));
+    }
     let play = widgets
         .iter()
         .filter(|w| w.style_context().has_class("play-fab"))
@@ -178,6 +197,20 @@ fn gtk_smoke() {
         .and_then(|widget| widget.downcast_ref::<gtk::Label>())
         .unwrap();
     let original_title = now_title.text();
+    let mute = widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<gtk::Button>())
+        .find(|button| button.tooltip_text().as_deref() == Some("Выключить звук"))
+        .unwrap();
+    mute.emit_clicked();
+    pump(150);
+    assert_eq!(mute.tooltip_text().as_deref(), Some("Включить звук"));
+    assert!(read_saved_session().unwrap().muted);
+    mute.emit_clicked();
+    pump(150);
+    assert_eq!(mute.tooltip_text().as_deref(), Some("Выключить звук"));
+    assert!(!read_saved_session().unwrap().muted);
+
     let original_position = play_position();
     next.emit_clicked();
     pump(400);
@@ -204,6 +237,26 @@ fn gtk_smoke() {
     play.emit_clicked();
     pump(300);
 
+    let transport_buttons: Vec<_> = widgets
+        .iter()
+        .filter(|widget| widget.style_context().has_class("transport-button"))
+        .collect();
+    assert_eq!(transport_buttons.len(), 4);
+    for button in transport_buttons {
+        assert_eq!(
+            (button.allocated_width(), button.allocated_height()),
+            if button.style_context().has_class("mode") {
+                (40, 40)
+            } else {
+                (48, 48)
+            }
+        );
+    }
+    next.set_state_flags(gtk::StateFlags::PRELIGHT, false);
+    pump(200);
+    capture("transport-next-hover");
+    next.unset_state_flags(gtk::StateFlags::PRELIGHT);
+
     assert!(!play.gets_focus_on_click());
     assert!(play.can_focus());
     play.grab_focus();
@@ -224,14 +277,14 @@ fn gtk_smoke() {
         .iter()
         .filter(|w| w.style_context().has_class("timecode"))
         .filter_map(|w| w.downcast_ref::<gtk::Label>())
-        .any(|label| label.text() == "0:20"));
+        .any(|label| label.text().starts_with("−0:")));
     play.emit_clicked();
     pump(300);
     assert_eq!(play.tooltip_text().as_deref(), Some("Воспроизвести"));
     assert!(widgets
         .iter()
         .filter_map(|w| w.downcast_ref::<gtk::Label>())
-        .any(|label| label.text() == "Показать текст" && label.is_visible()));
+        .any(|label| label.text() == "Текст песни" && label.is_visible()));
 
     let nav: Vec<gtk::Button> = widgets
         .iter()
@@ -271,18 +324,27 @@ fn gtk_smoke() {
             .into_iter()
             .find_map(|widget| widget.downcast::<gtk::Menu>().ok())
             .unwrap();
-        menu.children()
+        let item = menu
+            .children()
             .into_iter()
             .find_map(|widget| {
                 let item = widget.downcast::<gtk::MenuItem>().ok()?;
                 (item.label().as_deref() == Some(name)).then_some(item)
             })
-            .unwrap()
-            .activate();
+            .unwrap();
+        assert!(item.is_visible());
+        item.activate();
         menu.popdown();
         pump(180);
     };
     let original_queue = read_saved_session().unwrap().paths;
+    action(0, "Скопировать название");
+    assert_eq!(
+        gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD)
+            .wait_for_text()
+            .as_deref(),
+        Some(original_title.as_str())
+    );
     action(2, "Переместить выше");
     assert_eq!(read_saved_session().unwrap().paths[1], original_queue[2]);
     action(1, "Поставить следующим");
@@ -424,7 +486,7 @@ fn gtk_smoke() {
     );
     capture("compact-lyrics");
     assert!(descendants(window.upcast_ref()).iter().any(|widget| {
-        widget.style_context().has_class("sidebar") && widget.allocated_width() <= 72
+        widget.style_context().has_class("sidebar") && widget.allocated_width() <= 76
     }));
 
     let resume = widgets
@@ -579,10 +641,17 @@ fn gtk_smoke() {
         .filter_map(|w| w.downcast_ref::<gtk::ToggleButton>())
         .find(|button| button.label().as_deref() == Some("1.25×"))
         .unwrap();
-    let covers = controls
-        .iter()
-        .find_map(|w| w.downcast_ref::<gtk::Switch>())
-        .unwrap();
+    let named_switch = |label: &str| {
+        controls
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Switch>())
+            .find(|switch| switch.tooltip_text().as_deref() == Some(label))
+            .unwrap()
+    };
+    let covers = named_switch("Загружать обложки из Яндекс Музыки");
+    let dynamic = named_switch("Динамический фон");
+    let animate = named_switch("Анимации");
+    let expanded = named_switch("Расширенная боковая панель");
     let csv = controls
         .iter()
         .filter_map(|w| w.downcast_ref::<gtk::Button>())
@@ -596,31 +665,18 @@ fn gtk_smoke() {
         .find(|w| w.style_context().has_class("sidebar"))
         .unwrap();
     let rail_controls = descendants(rail);
-    let indicators: Vec<_> = rail_controls
+    let rail_buttons: Vec<_> = rail_controls
         .iter()
-        .filter(|w| w.style_context().has_class("rail-indicator"))
+        .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
         .collect();
-    assert_eq!(indicators.len(), 6);
-    for indicator in indicators {
-        assert_eq!(
-            (indicator.allocated_width(), indicator.allocated_height()),
-            (56, 32)
-        );
-        let image = indicator
-            .downcast_ref::<gtk::Box>()
-            .unwrap()
-            .center_widget()
-            .unwrap();
-        assert_eq!(image.downcast_ref::<gtk::Image>().unwrap().pixel_size(), 24);
-    }
-    for button in rail_controls
-        .iter()
-        .filter_map(|w| w.downcast_ref::<gtk::Button>())
-    {
-        assert_eq!(
-            (button.allocated_width(), button.allocated_height()),
-            (56, 56)
-        );
+    assert_eq!(rail_buttons.len(), 5);
+    for button in rail_buttons {
+        assert!(button.allocated_width() >= 56);
+        assert_eq!(button.allocated_height(), 56);
+        assert!(descendants(button.upcast_ref())
+            .iter()
+            .filter_map(|widget| widget.downcast_ref::<gtk::Image>())
+            .any(|image| image.pixel_size() == 22));
     }
     let clock = widgets
         .iter()
@@ -664,10 +720,10 @@ fn gtk_smoke() {
         let pixbuf = Pixbuf::new(Colorspace::Rgb, false, 8, 16, 16).unwrap();
         pixbuf.fill(rgba);
         pixbuf.savev(&path, "png", &[]).unwrap();
-        let original = primary();
+        let original = stage_color();
         theme::set_cover(Some(&path));
         pump(240);
-        assert_ne!(primary(), original);
+        assert_ne!(stage_color(), original);
         assert!(page.is_mapped() && settings.style_context().has_class("selected"));
         for (foreground, background) in [
             ("md_on_surface", "md_surface"),
@@ -686,6 +742,18 @@ fn gtk_smoke() {
         capture(&format!("settings-{name}"));
     }
     theme::set_cover(Some(&artwork));
+    dynamic.set_active(false);
+    assert_eq!(
+        stage_color(),
+        window
+            .style_context()
+            .lookup_color("md_surface_low")
+            .unwrap()
+    );
+    animate.set_active(false);
+    expanded.set_active(true);
+    pump(220);
+    assert!(rail.allocated_width() >= 156);
     window.resize(780, 510);
     pump(350);
     assert!(
@@ -778,44 +846,6 @@ fn gtk_smoke() {
         "layout must fit minimum height: {:?}",
         window.size()
     );
-    let soundcloud_button = widgets
-        .iter()
-        .filter_map(|w| w.downcast_ref::<gtk::Button>())
-        .find(|button| button.tooltip_text().as_deref() == Some("Скачать с SoundCloud"))
-        .unwrap();
-    let lookup_was_pending = Rc::new(Cell::new(false));
-    let lookup_finished = Rc::new(Cell::new(false));
-    let pending = lookup_was_pending.clone();
-    let finished = lookup_finished.clone();
-    glib::timeout_add_local_once(Duration::from_millis(160), move || {
-        if let Some(dialog) = gtk::Window::list_toplevels()
-            .into_iter()
-            .find_map(|widget| {
-                let dialog = widget.downcast::<gtk::Dialog>().ok()?;
-                (dialog.title().as_deref() == Some("Скачать с SoundCloud")).then_some(dialog)
-            })
-        {
-            let has_status = |text: &str| {
-                descendants(dialog.upcast_ref())
-                    .iter()
-                    .filter_map(|w| w.downcast_ref::<gtk::Label>())
-                    .any(|label| label.text() == text)
-            };
-            pending.set(has_status("Проверяем доступ…"));
-            glib::timeout_add_local_once(Duration::from_millis(1300), move || {
-                finished.set(
-                    descendants(dialog.upcast_ref())
-                        .iter()
-                        .filter_map(|w| w.downcast_ref::<gtk::Label>())
-                        .any(|label| label.text() == "Токен не задан"),
-                );
-                dialog.response(gtk::ResponseType::Close);
-            });
-        }
-    });
-    soundcloud_button.emit_clicked();
-    assert!(lookup_was_pending.get());
-    assert!(lookup_finished.get());
     window.close();
     pump(300);
     build_ui(&app);
@@ -837,15 +867,35 @@ fn gtk_smoke() {
             .abs()
             < 0.001
     );
-    assert!(restarted_controls
-        .iter()
-        .find_map(|w| w.downcast_ref::<gtk::Switch>())
-        .unwrap()
-        .is_active());
+    for (name, active) in [
+        ("Загружать обложки из Яндекс Музыки", true),
+        ("Динамический фон", false),
+        ("Анимации", false),
+        ("Расширенная боковая панель", true),
+    ] {
+        let switch = restarted_controls
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Switch>())
+            .find(|switch| switch.tooltip_text().as_deref() == Some(name))
+            .unwrap();
+        assert_eq!(switch.is_active(), active, "{name}");
+    }
     assert!(restarted_controls
         .iter()
         .filter_map(|w| w.downcast_ref::<gtk::Button>())
         .any(|b| b.label().as_deref() == Some("Заменить…")));
+    let hero_cover = restarted_widgets
+        .iter()
+        .find(|w| w.style_context().has_class("cover-frame"))
+        .unwrap();
+    for (width, height) in [(1920, 1080), (1280, 720), (900, 600), (700, 500)] {
+        restarted.resize(width, height);
+        pump(250);
+        assert_eq!(restarted.size(), (width, height));
+        assert_eq!(hero_cover.allocated_width(), hero_cover.allocated_height());
+        assert!(hero_cover.allocated_height() <= height - 120);
+        capture(&format!("layout-{width}x{height}"));
+    }
     restarted.close();
 
     let long_model = test_model();
@@ -877,7 +927,7 @@ fn gtk_smoke() {
         state.tracks[1].title = "Я".into();
         state.tracks[1].artist = "А".into();
     }
-    let (long_page, views) = build_player_page(&long_model);
+    let (long_page, views) = now_playing::build(&long_model);
     let long_window = gtk::Window::new(gtk::WindowType::Toplevel);
     long_window.set_default_size(604, 390);
     long_window.add(&long_page);
@@ -894,7 +944,7 @@ fn gtk_smoke() {
         .unwrap()
         .downcast::<gtk::Label>()
         .unwrap();
-    assert_eq!(long_title.layout().unwrap().line_count(), 3);
+    assert!((2..=3).contains(&long_title.layout().unwrap().line_count()));
     assert_eq!(
         long_title.tooltip_text().as_deref(),
         Some(long_title.text().as_str())
@@ -905,6 +955,10 @@ fn gtk_smoke() {
         .iter()
         .find(|w| w.style_context().has_class("cover-frame"))
         .unwrap();
+    let details = elements
+        .iter()
+        .find(|widget| widget.style_context().has_class("track-details"))
+        .unwrap();
     let bounds = || {
         let (x, y) = frame.translate_coordinates(&long_window, 0, 0).unwrap();
         (x, y, frame.allocated_width(), frame.allocated_height())
@@ -914,9 +968,22 @@ fn gtk_smoke() {
         pump(400);
         assert_eq!(long_window.size(), (width, height));
         let initial = bounds();
-        assert_eq!((initial.2, initial.3), (288, 288));
+        assert_eq!(initial.2, initial.3);
+        assert!((200..=376).contains(&initial.2));
+        let (details_x, _) = details.translate_coordinates(&long_window, 0, 0).unwrap();
+        assert_eq!(
+            details_x - (initial.0 + initial.2),
+            if width < 680 { 16 } else { 32 }
+        );
+        let right_margin = width - details_x - details.allocated_width();
+        assert!(
+            (initial.0 - right_margin).abs() <= 1,
+            "the track group must be centered"
+        );
+
         for index in [1, 0, 1, 0] {
             long_model.borrow_mut().current = Some(index);
+            request_ui(&long_model);
             pump(380);
             assert_eq!(long_window.size(), (width, height));
             assert_eq!(bounds(), initial);
@@ -937,7 +1004,7 @@ fn gtk_smoke() {
     let empty = test_model();
     empty.borrow_mut().tracks.clear();
     empty.borrow_mut().current = None;
-    let (page, _) = build_player_page(&empty);
+    let (page, _) = now_playing::build(&empty);
     let empty_window = gtk::Window::new(gtk::WindowType::Toplevel);
     empty_window.set_default_size(860, 620);
     empty_window.add(&page);
@@ -1052,6 +1119,7 @@ fn gtk_smoke() {
         state.tracks.clear();
         state.current = None;
         state.library_revision += 1;
+        state.updates.request();
     }
     pump(300);
     assert!(queue_widgets
@@ -1079,7 +1147,7 @@ fn gtk_smoke() {
     automatic.borrow_mut().current = Some(1);
     start_lyrics_job(&automatic, false);
     assert_eq!(automatic.borrow().lyrics_pending.len(), 2);
-    pump(600);
+    pump_until(|| automatic.borrow().lyrics_pending.is_empty());
     {
         let state = automatic.borrow();
         assert!(state.lyrics_pending.is_empty());
@@ -1098,13 +1166,13 @@ fn gtk_smoke() {
         state.tracks[1].title.clear();
     }
     start_lyrics_job(&automatic, true);
-    pump(200);
+    pump_until(|| automatic.borrow().lyrics_pending.is_empty());
     assert!(automatic.borrow().lyrics_pending.is_empty());
     start_lyrics_job(&automatic, false);
     assert!(automatic.borrow().lyrics_pending.is_empty());
     automatic.borrow_mut().tracks[1].title = "second".into();
     start_lyrics_job(&automatic, true);
-    pump(400);
+    pump_until(|| automatic.borrow().lyrics_pending.is_empty());
     assert_eq!(automatic.borrow().tracks[1].lyrics[0].text, "second");
     window.close();
     pump(450);

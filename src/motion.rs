@@ -139,10 +139,10 @@ pub(crate) fn animate_button(button: &impl IsA<gtk::Button>) {
         if let Some(child) = button.child().filter(|child| child.is_visible()) {
             button.propagate_draw(&child, cr);
         }
-        let _ = cr.restore();
         if button.has_visible_focus() {
             gtk::render_focus(&style, cr, 0.0, 0.0, width, height);
         }
+        let _ = cr.restore();
         glib::Propagation::Stop
     });
 }

@@ -16,16 +16,20 @@ mod library;
 mod lyrics;
 mod motion;
 mod mpv;
+mod now_playing;
+mod playback_controls;
 mod session;
 mod shuffle;
-mod soundcloud;
 mod theme;
+mod track_menu;
+mod ui_updates;
 mod yandex_export;
 use library::{collect_audio, extract_cover, preview_track, read_track};
 use lyrics::online_lyrics;
 use mpv::Mpv;
-use session::Session;
+use session::{Appearance, Session};
 use shuffle::ShuffleOrder;
+use ui_updates::UiUpdates;
 
 const PAGE_NAMES: [&str; 3] = ["Плеер", "Очередь", "Настройки"];
 
@@ -47,6 +51,7 @@ struct Lyric {
 }
 
 struct Model {
+    updates: Rc<UiUpdates>,
     tracks: Vec<Track>,
     current: Option<usize>,
     library_revision: u64,
@@ -63,12 +68,17 @@ struct Model {
     repeat: usize,
     online_covers: bool,
     volume: f64,
+    muted: bool,
+    appearance: Appearance,
     speed: f64,
-    soundcloud_dir: PathBuf,
     status: Option<String>,
     imports_pending: usize,
     failed_tracks: std::collections::HashSet<usize>,
     mpv: Option<Mpv>,
+}
+
+fn request_ui(model: &Rc<RefCell<Model>>) {
+    model.borrow().updates.request();
 }
 
 fn main() {
@@ -82,6 +92,9 @@ fn main() {
     }
     let app = gtk::Application::new(Some("local.ownplayer.desktop"), Default::default());
     app.connect_startup(|_| {
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_gtk_application_prefer_dark_theme(true);
+        }
         if let Some(screen) = gtk::gdk::Screen::default() {
             theme::install(&screen);
         }
@@ -96,6 +109,7 @@ fn build_ui(app: &gtk::Application) {
         return;
     }
     let model = Rc::new(RefCell::new(Model {
+        updates: Rc::default(),
         tracks: Vec::new(),
         current: None,
         library_revision: 0,
@@ -112,22 +126,27 @@ fn build_ui(app: &gtk::Application) {
         repeat: 0,
         online_covers: true,
         volume: 75.0,
+        muted: false,
+        appearance: Appearance::default(),
         speed: 1.0,
-        soundcloud_dir: soundcloud::default_download_dir(),
         status: None,
         imports_pending: 0,
         failed_tracks: Default::default(),
         mpv: None,
     }));
     restore_session(&model);
+    let appearance = model.borrow().appearance;
+    theme::set_hue(None);
+    theme::set_dynamic(appearance.dynamic_background);
+    set_decorative_motion(appearance.animations);
     let window = gtk::ApplicationWindow::new(app);
     window.set_title("Veyra");
-    window.set_default_size(1160, 780);
-    window.set_size_request(760, 480);
+    window.set_default_size(1160, 760);
+    window.set_size_request(640, 460);
     window.set_position(gtk::WindowPosition::Center);
 
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    root.set_border_width(16);
+    root.set_border_width(12);
 
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 4);
     sidebar.set_size_request(72, -1);
@@ -136,7 +155,7 @@ fn build_ui(app: &gtk::Application) {
     let brand = gtk::Box::new(gtk::Orientation::Vertical, 0);
     brand.set_halign(gtk::Align::Center);
     brand.set_size_request(40, 40);
-    brand.set_margin_bottom(16);
+    brand.set_margin_bottom(12);
     brand.style_context().add_class("brand-mark");
     let brand_icon = symbolize("audio-x-generic-symbolic", 20);
     brand_icon.style_context().add_class("brand-icon");
@@ -144,6 +163,8 @@ fn build_ui(app: &gtk::Application) {
     sidebar.pack_start(&brand, false, false, 0);
 
     let pages = gtk::Stack::new();
+    pages.set_hhomogeneous(false);
+    pages.set_vhomogeneous(false);
     pages.set_transition_type(gtk::StackTransitionType::Crossfade);
     pages.set_transition_duration(180);
     let page_buttons: Rc<RefCell<Vec<gtk::Button>>> = Rc::new(RefCell::new(Vec::new()));
@@ -154,7 +175,7 @@ fn build_ui(app: &gtk::Application) {
         } else {
             "view-list-symbolic"
         };
-        let button = nav_button(icon, &name);
+        let button = rail_button(icon, &name, &name, "nav-item");
         let pages_clone = pages.clone();
         let all_buttons = Rc::downgrade(&page_buttons);
         button.connect_clicked(move |_| {
@@ -170,13 +191,26 @@ fn build_ui(app: &gtk::Application) {
     }
     let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar.pack_start(&spacer, true, true, 0);
-    let add_files = action_button("document-open-symbolic", "Добавить файлы");
-    let add_folder = action_button("folder-open-symbolic", "Добавить папку");
-    let download = action_button("document-save-symbolic", "Скачать с SoundCloud");
-    let settings = action_button("preferences-system-symbolic", "Настройки");
+    let add_files = rail_button(
+        "list-add-symbolic",
+        "Файлы",
+        "Добавить файлы",
+        "sidebar-action",
+    );
+    let add_folder = rail_button(
+        "folder-open-symbolic",
+        "Папка",
+        "Добавить папку",
+        "sidebar-action",
+    );
+    let settings = rail_button(
+        "preferences-system-symbolic",
+        "Настройки",
+        "Настройки",
+        "sidebar-action",
+    );
     sidebar.pack_start(&add_files, false, false, 0);
     sidebar.pack_start(&add_folder, false, false, 0);
-    sidebar.pack_start(&download, false, false, 0);
     let sidebar_divider = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     sidebar_divider.set_size_request(-1, 1);
     sidebar_divider.set_margin_top(8);
@@ -185,6 +219,8 @@ fn build_ui(app: &gtk::Application) {
     sidebar.pack_start(&sidebar_divider, false, false, 0);
     sidebar.pack_start(&settings, false, false, 0);
     page_buttons.borrow_mut().push(settings.clone());
+
+    apply_sidebar_mode(&sidebar, appearance.expanded_sidebar);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -200,13 +236,13 @@ fn build_ui(app: &gtk::Application) {
     subheading.set_margin_bottom(10);
     content.pack_start(&header, false, false, 0);
 
-    let (player_page, _) = build_player_page(&model);
+    let (player_page, _) = now_playing::build(&model);
     let (queue_page, queue_search) = build_queue_page(&model);
     pages.add_named(&player_page, "Плеер");
     pages.add_named(&queue_page, "Очередь");
-    pages.add_named(&build_settings_page(&model), "Настройки");
+    pages.add_named(&build_settings_page(&model, &sidebar), "Настройки");
     content.pack_start(&pages, true, true, 0);
-    let controls = build_controls(&model);
+    let controls = playback_controls::build(&model);
 
     let main_column = gtk::Box::new(gtk::Orientation::Vertical, 12);
     main_column.pack_start(&content, true, true, 0);
@@ -245,7 +281,8 @@ fn build_ui(app: &gtk::Application) {
     });
     let settings_pages = pages.downgrade();
     let settings_buttons = Rc::downgrade(&page_buttons);
-    window.connect_key_press_event(move |_, event| {
+    let keyboard_model = model.clone();
+    window.connect_key_press_event(move |window, event| {
         let key = event.keyval();
         let modifiers = event.state() & gtk::accelerator_get_default_mod_mask();
         if key == gtk::gdk::keys::constants::f && modifiers == gtk::gdk::ModifierType::CONTROL_MASK
@@ -268,10 +305,11 @@ fn build_ui(app: &gtk::Application) {
                 }
             }
         }
+        if playback_controls::shortcut(window, event, &keyboard_model) {
+            return glib::Propagation::Stop;
+        }
         glib::Propagation::Proceed
     });
-    let model_download = model.clone();
-    download.connect_clicked(move |_| show_soundcloud_dialog(&model_download));
     let model_close = model.clone();
     window.connect_delete_event(move |_, _| {
         save_session(&model_close);
@@ -283,12 +321,8 @@ fn build_ui(app: &gtk::Application) {
     window.connect_destroy(move |_| buttons_lifetime.borrow_mut().clear());
     let model_count = model.clone();
     let subheading_update = subheading.clone();
-    let alive = widget_lifetime(&window);
-    let header_alive = alive.clone();
-    glib::timeout_add_local(Duration::from_millis(400), move || {
-        if !header_alive.get() {
-            return glib::ControlFlow::Break;
-        }
+    let updates = model.borrow().updates.clone();
+    updates.listen(&window, move || {
         let state = model_count.borrow();
         let text = if let Some(message) = &state.status {
             message.as_str()
@@ -301,20 +335,22 @@ fn build_ui(app: &gtk::Application) {
             subheading_update.set_text(text);
             subheading_update.set_visible(!text.is_empty());
         }
-        glib::ControlFlow::Continue
+    });
+    updates.listen(&window, {
+        let model = Rc::downgrade(&model);
+        move || {
+            if let Some(model) = model.upgrade() {
+                arm_mpv_writes(&model);
+            }
+        }
     });
 
     start_mpv(&model);
-    let model_tick = model.clone();
-    glib::timeout_add_local(Duration::from_millis(200), move || {
-        if !alive.get() {
-            return glib::ControlFlow::Break;
-        }
-        start_lyrics_job(&model_tick, false);
-        glib::ControlFlow::Continue
-    });
+
+    sync_stack_motion(window.upcast_ref());
     motion::animate_buttons(window.upcast_ref());
     window.show_all();
+    window.set_focus(gtk::Widget::NONE);
 }
 
 fn symbolize(name: &str, size: i32) -> gtk::Image {
@@ -338,38 +374,45 @@ fn describe_control(widget: &impl IsA<gtk::Widget>, label: &str) {
     }
 }
 
-fn nav_button(icon: &str, label: &str) -> gtk::Button {
+fn rail_button(icon: &str, label: &str, tooltip: &str, class: &str) -> gtk::Button {
     let button = gtk::Button::new();
-    button.style_context().add_class("nav-item");
+    button.style_context().add_class(class);
     button.set_focus_on_click(false);
-    describe_control(&button, label);
+    describe_control(&button, tooltip);
     let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
     column.set_halign(gtk::Align::Center);
-    let indicator = rail_indicator(icon);
-    let text = gtk::Label::new(Some(label));
-    column.pack_start(&indicator, false, false, 0);
-    column.pack_start(&text, false, false, 0);
+    column.set_valign(gtk::Align::Center);
+    column.pack_start(&symbolize(icon, 22), false, false, 0);
+    column.pack_start(&gtk::Label::new(Some(label)), false, false, 0);
     button.add(&column);
     button
 }
 
-fn action_button(icon: &str, label: &str) -> gtk::Button {
-    let button = gtk::Button::new();
-    button.style_context().add_class("sidebar-action");
-    button.set_focus_on_click(false);
-    describe_control(&button, label);
-    button.add(&rail_indicator(icon));
-    button
-}
-
-fn rail_indicator(icon: &str) -> gtk::Box {
-    let indicator = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    indicator.style_context().add_class("rail-indicator");
-    indicator.set_size_request(56, 32);
-    indicator.set_halign(gtk::Align::Center);
-    indicator.set_valign(gtk::Align::Center);
-    indicator.set_center_widget(Some(&symbolize(icon, 24)));
-    indicator
+fn apply_sidebar_mode(sidebar: &gtk::Box, expanded: bool) {
+    sidebar.set_width_request(if expanded { 156 } else { 72 });
+    set_style_class(sidebar, "expanded", expanded);
+    for button in sidebar
+        .children()
+        .into_iter()
+        .filter_map(|child| child.downcast::<gtk::Button>().ok())
+    {
+        if let Some(content) = button
+            .child()
+            .and_then(|child| child.downcast::<gtk::Box>().ok())
+        {
+            content.set_orientation(if expanded {
+                gtk::Orientation::Horizontal
+            } else {
+                gtk::Orientation::Vertical
+            });
+            content.set_spacing(if expanded { 12 } else { 4 });
+            content.set_halign(if expanded {
+                gtk::Align::Start
+            } else {
+                gtk::Align::Center
+            });
+        }
+    }
 }
 
 fn cover_placeholder(size: i32, glyph: i32) -> gtk::Box {
@@ -402,204 +445,22 @@ fn set_page(pages: &gtk::Stack, buttons: &Rc<RefCell<Vec<gtk::Button>>>, index: 
     }
 }
 
-fn build_player_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::Stack) {
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    page.style_context().add_class("player-stage");
-
-    let views = gtk::Stack::new();
-    views.set_transition_type(gtk::StackTransitionType::Crossfade);
-    views.set_transition_duration(180);
-    page.pack_start(&views, true, true, 0);
-
-    const ARTWORK_SIZE: i32 = 288;
-    const HERO_SPACING: i32 = 32;
-    const HERO_INSET: i32 = 24;
-    const DETAILS_MIN: i32 = 180;
-    let artwork = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    artwork.set_size_request(
-        ARTWORK_SIZE + HERO_SPACING + 2 * HERO_INSET + DETAILS_MIN,
-        ARTWORK_SIZE + 32,
-    );
-    let hero = gtk::Box::new(gtk::Orientation::Horizontal, HERO_SPACING);
-    hero.set_valign(gtk::Align::Center);
-    hero.set_margin_top(16);
-    hero.set_margin_bottom(16);
-    hero.set_margin_start(HERO_INSET);
-    hero.set_margin_end(HERO_INSET);
-
-    let cover_frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    cover_frame.style_context().add_class("cover-frame");
-    cover_frame.set_size_request(ARTWORK_SIZE, ARTWORK_SIZE);
-    cover_frame.set_valign(gtk::Align::Center);
-    let cover_stack = gtk::Stack::new();
-    cover_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-    cover_stack.set_transition_duration(180);
-    cover_stack.add_named(&cover_placeholder(ARTWORK_SIZE, 84), "placeholder");
-    let cover = gtk::Image::new();
-    cover.set_size_request(ARTWORK_SIZE, ARTWORK_SIZE);
-    cover_stack.add_named(&cover, "image");
-    cover_stack.set_visible_child_name("placeholder");
-    let cover_alt = gtk::Image::new();
-    cover_alt.set_size_request(ARTWORK_SIZE, ARTWORK_SIZE);
-    cover_stack.add_named(&cover_alt, "image-alt");
-    cover_frame.pack_start(&cover_stack, true, true, 0);
-    hero.pack_start(&cover_frame, false, false, 0);
-
-    let details = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    details.set_valign(gtk::Align::Center);
-    details.set_size_request(DETAILS_MIN, -1);
-    details.style_context().add_class("track-details");
-    let title = gtk::Label::new(Some("Добавь музыку"));
-    title.set_xalign(0.0);
-    title.set_line_wrap(true);
-    title.set_lines(3);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.set_max_width_chars(1);
-    title.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
-    title.style_context().add_class("track-title");
-    let artist = gtk::Label::new(Some("Выбери файлы или добавь папку с музыкой"));
-    artist.set_xalign(0.0);
-    artist.set_line_wrap(true);
-    artist.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
-    artist.set_lines(2);
-    artist.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    artist.set_max_width_chars(1);
-    artist.style_context().add_class("track-artist");
-    let album = gtk::Label::new(None);
-    album.set_xalign(0.0);
-    album.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    album.set_max_width_chars(1);
-    album.set_no_show_all(true);
-    album.style_context().add_class("track-album");
-    let show_lyrics = gtk::Button::new();
-    show_lyrics.style_context().add_class("lyrics-action");
-    show_lyrics.set_focus_on_click(false);
-    let lyrics_row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-    lyrics_row.pack_start(&symbolize("format-text-rich-symbolic", 16), false, false, 0);
-    lyrics_row.pack_start(&gtk::Label::new(Some("Показать текст")), false, false, 0);
-    show_lyrics.add(&lyrics_row);
-    show_lyrics.set_halign(gtk::Align::Start);
-    show_lyrics.set_margin_top(16);
-    let views_lyrics = views.downgrade();
-    show_lyrics.connect_clicked(move |_| {
-        if let Some(views) = views_lyrics.upgrade() {
-            views.set_visible_child_name("lyrics");
-        }
-    });
-    details.pack_start(&title, false, false, 0);
-    details.pack_start(&artist, false, false, 0);
-    details.pack_start(&album, false, false, 0);
-    details.pack_start(&show_lyrics, false, false, 0);
-    let start = gtk::Button::with_label("Добавить музыку");
-    start.style_context().add_class("tonal-button");
-    start.set_halign(gtk::Align::Start);
-    start.set_margin_top(22);
-    let model_start = model.clone();
-    start.connect_clicked(move |_| {
-        if let Some(paths) = choose_files(false) {
-            append_paths(&model_start, paths);
-        }
-    });
-    details.pack_start(&start, false, false, 0);
-    start.show_all();
-    show_lyrics.show_all();
-    start.set_no_show_all(true);
-    show_lyrics.set_no_show_all(true);
-    start.set_visible(model.borrow().current.is_none());
-    show_lyrics.set_visible(model.borrow().current.is_some());
-    // The details column consumes only the width left over after allocating the cover.
-    hero.pack_start(&details, true, true, 0);
-    artwork.pack_start(&hero, true, true, 0);
-    views.add_named(&artwork, "artwork");
-    views.add_named(&build_lyrics_view(model, &views), "lyrics");
-    views.set_visible_child_name("artwork");
-    let mapped = Rc::new(Cell::new(false));
-    views.connect_map(move |stack| {
-        if !mapped.replace(true) {
-            stack.set_visible_child_name("artwork");
-        }
-    });
-
-    let model_update = model.clone();
-    let views_update = views.downgrade();
-    let alive = widget_lifetime(&page);
-    let mut rendered: Option<(PathBuf, String, String, String)> = None;
-    let mut rendered_cover = None;
-    glib::timeout_add_local(Duration::from_millis(120), move || {
-        if !alive.get() {
-            return glib::ControlFlow::Break;
-        }
-        let state = model_update.borrow();
-        if let Some(index) = state.current {
-            if let Some(track) = state.tracks.get(index) {
-                if rendered
-                    .as_ref()
-                    .map(|(path, title, artist, album)| (path, title, artist, album))
-                    != Some((&track.path, &track.title, &track.artist, &track.album))
-                {
-                    rendered = Some((
-                        track.path.clone(),
-                        track.title.clone(),
-                        track.artist.clone(),
-                        track.album.clone(),
-                    ));
-                    start.hide();
-                    show_lyrics.show();
-                    title.set_text(&track.title);
-                    title.set_tooltip_text(Some(&track.title));
-                    artist.set_text(&track.artist);
-                    artist.set_tooltip_text(Some(&track.artist));
-                    album.set_text(&track.album);
-                    album.set_tooltip_text(Some(&track.album));
-                    album.set_visible(!track.album.is_empty());
-                }
-                if let Some(pixbuf) =
-                    current_artwork(track, &mut rendered_cover, &state.cover_pending)
-                {
-                    crossfade_cover(
-                        &cover_stack,
-                        &cover,
-                        &cover_alt,
-                        pixbuf.as_ref().and_then(|art| art.hero.as_ref()),
-                    );
-                }
-            }
-        }
-        if state.current.is_none() && rendered.take().is_some() {
-            title.set_text("Добавь музыку");
-            title.set_tooltip_text(None);
-            artist.set_text("Выбери файлы или добавь папку с музыкой");
-            artist.set_tooltip_text(None);
-            album.hide();
-            show_lyrics.hide();
-            start.show();
-            rendered_cover = None;
-            cover_stack.set_visible_child_name("placeholder");
-            if let Some(views) = views_update.upgrade() {
-                views.set_visible_child_name("artwork");
-            }
-        }
-        glib::ControlFlow::Continue
-    });
-    (page.upcast(), views)
-}
-
 // Keep the visible image until the selected track's cover lookup and decode settle.
 fn current_artwork(
     track: &Track,
     rendered: &mut Option<(Option<PathBuf>, Option<PathBuf>)>,
-    pending: &std::collections::HashSet<PathBuf>,
+    state: &Model,
 ) -> Option<Option<Rc<artwork::Artwork>>> {
     let missing_cover_track = track.cover_path.is_none().then_some(&track.path);
     if rendered
         .as_ref()
         .map(|(cover, track)| (cover.as_ref(), track.as_ref()))
         == Some((track.cover_path.as_ref(), missing_cover_track))
-        || (missing_cover_track.is_some() && pending.contains(&track.path))
+        || (missing_cover_track.is_some() && state.cover_pending.contains(&track.path))
     {
         return None;
     }
-    let image = artwork::get(track.cover_path.as_deref(), true)?;
+    let image = artwork::get(track.cover_path.as_deref(), true, &state.updates)?;
     *rendered = Some((track.cover_path.clone(), missing_cover_track.cloned()));
     Some(image)
 }
@@ -728,7 +589,7 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
     let empty_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
     empty_box.set_halign(gtk::Align::Center);
     empty_box.set_valign(gtk::Align::Center);
-    let empty_icon = symbolize("format-text-rich-symbolic", 40);
+    let empty_icon = symbolize("format-justify-left-symbolic", 40);
     empty_icon.style_context().add_class("empty-glyph");
     empty_box.pack_start(&empty_icon, false, false, 0);
     let empty = gtk::Label::new(Some("Выбери трек, чтобы увидеть текст"));
@@ -778,6 +639,7 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
 
     let model_find = model.clone();
     find.connect_clicked(move |_| start_lyrics_job(&model_find, true));
+    let updates = model.borrow().updates.clone();
     let browsing_until = Rc::new(Cell::new(Instant::now()));
     let seek_browsing = browsing_until.clone();
     let explicit_seek = Rc::new(Cell::new(false));
@@ -791,21 +653,13 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
             .and_then(|i| state.tracks.get(i))
             .and_then(|t| t.lyrics.get(line_index))
             .and_then(|line| line.time);
-        if let (Some(time), Some(player)) =
-            (time, state.mpv.as_mut().filter(|player| player.loaded))
-        {
-            if player
-                .command(json!(["seek", time, "absolute+exact"]))
-                .is_ok()
-            {
-                if player.paused {
-                    // mpv can report the preceding decoded position while paused.
-                    player.paused_lyric_position = Some(time);
-                }
+        if let (Some(time), Some(player)) = (time, state.mpv.as_mut()) {
+            if playback_controls::seek_absolute(player, time) {
                 seek_browsing.set(Instant::now());
                 row_seek.set(true);
             }
         }
+        state.updates.request();
         list.select_row(None::<&gtk::ListBoxRow>);
     });
     let resume = gtk::Button::with_label("К текущей строке");
@@ -826,9 +680,30 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
         let browsing = browsing_until.clone();
         let motion = follow.clone();
         let adjustment = adjustment.clone();
+        let updates = updates.clone();
+        let timeout = Rc::new(RefCell::new(None::<glib::SourceId>));
+        let active_timeout = timeout.clone();
+        lyrics_scroll.connect_destroy(move |_| {
+            if let Some(source) = active_timeout.take() {
+                source.remove();
+            }
+        });
         move || {
-            browsing.set(Instant::now() + Duration::from_secs(5));
+            let cooldown = Duration::from_secs(5);
+            browsing.set(Instant::now() + cooldown);
             motion.snap(adjustment.value());
+            updates.request();
+            if let Some(source) = timeout.take() {
+                source.remove();
+            }
+            let pending = timeout.clone();
+            let updates = Rc::downgrade(&updates);
+            timeout.replace(Some(glib::timeout_add_local_once(cooldown, move || {
+                pending.take();
+                if let Some(updates) = updates.upgrade() {
+                    updates.request();
+                }
+            })));
         }
     };
     let wheel_browse = browse.clone();
@@ -852,7 +727,21 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
         });
     }
     let browsing = browsing_until.clone();
-    resume.connect_clicked(move |_| browsing.set(Instant::now()));
+    resume.connect_clicked({
+        let updates = updates.clone();
+        move |_| {
+            browsing.set(Instant::now());
+            updates.request();
+        }
+    });
+    adjustment.connect_changed({
+        let updates = updates.clone();
+        move |_| updates.request()
+    });
+    lyrics_scroll.connect_size_allocate({
+        let updates = updates.clone();
+        move |_, _| updates.request()
+    });
 
     let model_update = model.clone();
     let list_update = lyrics_list.clone();
@@ -865,13 +754,13 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
     let backdrop_update = backdrop.clone();
     let backdrop_source_update = backdrop_source.clone();
 
-    let alive = widget_lifetime(&overlay);
     let lyrics_view = overlay.downgrade();
     let mut rendered_track: Option<PathBuf> = None;
     let mut rendered_cover = None;
     let mut rendered_lines: Vec<Lyric> = Vec::new();
     let mut rendered_labels = None;
     let mut focus_style: Option<(Option<usize>, bool)> = None;
+    let mut dynamic_background = model.borrow().appearance.dynamic_background;
     let mut synchronized = false;
     let mut active = None;
     let mut lyric_times = Vec::new();
@@ -879,14 +768,19 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
     let mut snap_follow = false;
     let mut rendered_status: Option<(bool, bool, bool, Option<String>)> = None;
 
-    glib::timeout_add_local(Duration::from_millis(120), move || {
-        if !alive.get() {
-            return glib::ControlFlow::Break;
-        }
+    updates.listen(&overlay, move || {
         if !lyrics_view.upgrade().is_some_and(|view| view.is_mapped()) {
-            return glib::ControlFlow::Continue;
+            return;
         }
         let state = model_update.borrow();
+        if dynamic_background != state.appearance.dynamic_background {
+            dynamic_background = state.appearance.dynamic_background;
+            rendered_cover = None;
+            backdrop_source_update.replace(None);
+            backdrop_previous.replace(None);
+            backdrop_mix.snap(1.0);
+            backdrop_update.queue_draw();
+        }
         if let Some(index) = state.current {
             if let Some(track) = state.tracks.get(index) {
                 let pending = state.lyrics_pending.contains(&track.path);
@@ -931,8 +825,9 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
                     }
                     body_update.set_visible_child_name(if status.0 { "empty" } else { "list" });
                 }
-                if let Some(image) =
-                    current_artwork(track, &mut rendered_cover, &state.cover_pending)
+                if let Some(image) = dynamic_background
+                    .then(|| current_artwork(track, &mut rendered_cover, &state))
+                    .flatten()
                 {
                     let pixbuf = image.and_then(|image| image.backdrop.clone());
                     let previous = backdrop_source_update.replace(pixbuf);
@@ -1109,7 +1004,6 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
                 backdrop_update.queue_draw();
             }
         }
-        glib::ControlFlow::Continue
     });
     overlay.upcast()
 }
@@ -1136,17 +1030,34 @@ fn update_lyric_focus(
     }
 }
 
-fn widget_lifetime(widget: &impl IsA<gtk::Widget>) -> Rc<Cell<bool>> {
-    let alive = Rc::new(Cell::new(true));
-    let destroyed = alive.clone();
-    widget.connect_destroy(move |_| destroyed.set(false));
-    alive
+thread_local! {
+    static DECORATIVE_MOTION: Cell<bool> = const { Cell::new(true) };
 }
 
 fn animations_enabled() -> bool {
-    gtk::Settings::default()
-        .map(|settings| settings.property::<bool>("gtk-enable-animations"))
-        .unwrap_or(true)
+    DECORATIVE_MOTION.with(Cell::get)
+        && gtk::Settings::default()
+            .is_none_or(|settings| settings.property::<bool>("gtk-enable-animations"))
+}
+
+fn set_decorative_motion(enabled: bool) {
+    DECORATIVE_MOTION.with(|setting| setting.set(enabled));
+    theme::set_motion(enabled);
+}
+
+fn sync_stack_motion(widget: &gtk::Widget) {
+    if let Some(stack) = widget.downcast_ref::<gtk::Stack>() {
+        stack.set_transition_duration(if DECORATIVE_MOTION.with(Cell::get) {
+            180
+        } else {
+            0
+        });
+    }
+    if let Some(container) = widget.downcast_ref::<gtk::Container>() {
+        for child in container.children() {
+            sync_stack_motion(&child);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1210,6 +1121,20 @@ fn make_queue_row(
     let path = Rc::new(RefCell::new(PathBuf::new()));
     let actions = icon_button("view-more-symbolic", "Действия с треком", "queue-menu");
     actions.set_focus_on_click(true);
+    let context_menu = menu.downgrade();
+    let context_target = menu_target.clone();
+    let context_path = path.clone();
+    row.connect_button_press_event(move |row, event| {
+        if event.triggers_context_menu() {
+            if let Some(menu) = context_menu.upgrade() {
+                context_target.replace(context_path.borrow().clone());
+                menu.set_attach_widget(Some(row));
+                menu.popup_at_pointer(Some(event));
+                return glib::Propagation::Stop;
+            }
+        }
+        glib::Propagation::Proceed
+    });
     let menu = menu.downgrade();
     let menu_target = menu_target.clone();
     let menu_path = path.clone();
@@ -1391,6 +1316,7 @@ fn menu_button(menu: &gtk::Menu, tooltip: &str) -> gtk::MenuButton {
 
 fn edit_queue(model: &Rc<RefCell<Model>>, path: &Path, action: QueueEdit<'_>) -> bool {
     let mut state = model.borrow_mut();
+    state.updates.request();
     let Some(index) = state.tracks.iter().position(|track| track.path == path) else {
         return false;
     };
@@ -1490,6 +1416,18 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
         ("Убрать из очереди", QueueEdit::Remove),
     ] {
         let item = gtk::MenuItem::with_label(label);
+        if matches!(action, QueueEdit::PlayNext) {
+            let item = item.downgrade();
+            let model = model.clone();
+            let target = menu_target.clone();
+            row_menu.connect_map(move |_| {
+                let state = model.borrow();
+                let current = state.current.and_then(|index| state.tracks.get(index));
+                if let Some(item) = item.upgrade() {
+                    item.set_visible(current.is_none_or(|track| track.path != *target.borrow()));
+                }
+            });
+        }
         let model = model.clone();
         let path = menu_target.clone();
         item.connect_activate(move |_| {
@@ -1497,6 +1435,8 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
         });
         row_menu.append(&item);
     }
+    row_menu.append(&gtk::SeparatorMenuItem::new());
+    track_menu::add_details(&row_menu, model, &menu_target);
     row_menu.show_all();
 
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -1651,25 +1591,36 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
     footer.pack_start(&page_number, false, false, 0);
     footer.pack_start(&page_count, false, false, 4);
     footer.pack_start(&next, false, false, 0);
+    let updates = model.borrow().updates.clone();
     let requested_page = Rc::new(Cell::new(1_usize));
     let last_page = Rc::new(Cell::new(1_usize));
     previous.connect_clicked({
         let requested = requested_page.clone();
-        move |_| requested.set(requested.get().saturating_sub(1).max(1))
+        let updates = updates.clone();
+        move |_| {
+            requested.set(requested.get().saturating_sub(1).max(1));
+            updates.request();
+        }
     });
     next.connect_clicked({
         let requested = requested_page.clone();
         let last_page = last_page.clone();
-        move |_| requested.set((requested.get() + 1).min(last_page.get()))
+        let updates = updates.clone();
+        move |_| {
+            requested.set((requested.get() + 1).min(last_page.get()));
+            updates.request();
+        }
     });
     page_number.connect_activate({
         let requested = requested_page.clone();
         let last_page = last_page.clone();
+        let updates = updates.clone();
         move |entry| {
             if let Ok(value) = entry.text().trim().parse::<usize>() {
                 requested.set(value.clamp(1, last_page.get()));
             }
             entry.set_text(&requested.get().to_string());
+            updates.request();
         }
     });
     footer.show_all();
@@ -1683,9 +1634,13 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
     let jump_requested = Rc::new(Cell::new(false));
     let request = jump_requested.clone();
     let jump_search = search.clone();
-    jump.connect_activate(move |_| {
-        jump_search.set_text("");
-        request.set(true);
+    jump.connect_activate({
+        let updates = updates.clone();
+        move |_| {
+            jump_search.set_text("");
+            request.set(true);
+            updates.request();
+        }
     });
 
     let rows: Rc<RefCell<Vec<QueueRow>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1711,14 +1666,26 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
 
     let query = Rc::new(RefCell::new(String::new()));
     let search_query = query.clone();
-    search.connect_search_changed(move |entry| {
-        search_query.replace(entry.text().trim().to_lowercase());
+    search.connect_search_changed({
+        let updates = updates.clone();
+        move |entry| {
+            search_query.replace(entry.text().trim().to_lowercase());
+            updates.request();
+        }
+    });
+    let adjustment = scroll.vadjustment();
+    adjustment.connect_value_changed({
+        let updates = updates.clone();
+        move |_| updates.request()
+    });
+    adjustment.connect_changed({
+        let updates = updates.clone();
+        move |_| updates.request()
     });
 
     let model_update = model.clone();
     let rows_update = rows.clone();
     let page_update = page.downgrade();
-    let alive = widget_lifetime(&page);
     let mut rendered_revision = u64::MAX;
     let mut rendered_query = String::new();
     let mut search_keys = Vec::new();
@@ -1729,12 +1696,9 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
     let mut selected_page = usize::MAX;
     let mut jump_to = None;
     let mut visible_covers = Vec::new();
-    let mut update = move || {
-        if !alive.get() {
-            return None;
-        }
+    updates.listen(&page, move || {
         if !page_update.upgrade().is_some_and(|page| page.is_mapped()) {
-            return Some(Duration::from_millis(64));
+            return;
         }
         let mut state = model_update.borrow_mut();
         let track_count = state.tracks.len();
@@ -1915,6 +1879,9 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
         if clear_all.is_sensitive() != (track_count > 0) {
             clear_all.set_sensitive(track_count > 0);
         }
+        if !complete || jump_to.is_some() {
+            state.updates.request();
+        }
         drop(state);
         // Load only visible rows (+ a small buffer), with bounded background work.
         if scroll.is_mapped() {
@@ -1948,7 +1915,9 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
                 }
                 visible.push(index);
                 if *item.rendered_cover.borrow() != track.cover_path {
-                    if let Some(image) = artwork::get(track.cover_path.as_deref(), false) {
+                    if let Some(image) =
+                        artwork::get(track.cover_path.as_deref(), false, &state.updates)
+                    {
                         if let Some(image) = image {
                             item.cover.set_from_pixbuf(Some(&image.thumb));
                             item.cover_stack.set_visible_child_name("image");
@@ -1991,454 +1960,27 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
                 start_cover_job(&model_update, path);
             }
         }
-        Some(Duration::from_millis(if complete { 64 } else { 16 }))
-    };
-    glib::MainContext::default().spawn_local(async move {
-        while let Some(delay) = update() {
-            glib::timeout_future(delay).await;
-        }
     });
     (page.upcast(), search)
 }
 
-fn build_controls(model: &Rc<RefCell<Model>>) -> gtk::Widget {
-    let panel = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    panel.style_context().add_class("player-bar");
-
-    let seek_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let time = gtk::Label::new(Some("0:00"));
-    time.style_context().add_class("timecode");
-    let seek = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1000.0, 1.0);
-    seek.set_draw_value(false);
-    describe_control(&seek, "Позиция воспроизведения");
-    seek.style_context().add_class("seek");
-    let duration = gtk::Label::new(Some("0:00"));
-    duration.style_context().add_class("timecode");
-    seek_row.pack_start(&time, false, false, 0);
-    seek_row.pack_start(&seek, true, true, 0);
-    seek_row.pack_start(&duration, false, false, 0);
-    seek_row.style_context().add_class("timeline");
-
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 18);
-    let now_box = gtk::Box::new(gtk::Orientation::Horizontal, 14);
-    now_box.set_valign(gtk::Align::Center);
-    now_box.style_context().add_class("now-playing");
-    let small_frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    small_frame.style_context().add_class("mini-cover-frame");
-    small_frame.set_size_request(48, 48);
-    let small_stack = gtk::Stack::new();
-    small_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-    small_stack.set_transition_duration(180);
-    small_stack.add_named(&cover_placeholder(48, 20), "placeholder");
-    let small_image = gtk::Image::new();
-    small_image.set_size_request(48, 48);
-    small_stack.add_named(&small_image, "image");
-    let small_alt = gtk::Image::new();
-    small_alt.set_size_request(48, 48);
-    small_stack.add_named(&small_alt, "image-alt");
-    small_stack.set_visible_child_name("placeholder");
-    small_frame.pack_start(&small_stack, true, true, 0);
-    now_box.pack_start(&small_frame, false, false, 0);
-    let now_text = gtk::Box::new(gtk::Orientation::Vertical, 1);
-    now_text.set_valign(gtk::Align::Center);
-    let now = gtk::Label::new(Some("Трек не выбран"));
-    now.set_xalign(0.0);
-    now.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    now.set_max_width_chars(26);
-    now.style_context().add_class("now-title");
-    let now_artist = gtk::Label::new(Some(""));
-    now_artist.set_xalign(0.0);
-    now_artist.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    now_artist.set_max_width_chars(26);
-    now_artist.style_context().add_class("now-artist");
-    now_text.pack_start(&now, false, false, 0);
-    now_text.pack_start(&now_artist, false, false, 0);
-    now_box.pack_start(&now_text, true, true, 0);
-    row.pack_start(&now_box, true, true, 0);
-
-    let shuffle = gtk::ToggleButton::new();
-    shuffle.set_focus_on_click(false);
-    shuffle.add(&toggle_content(&symbolize(
-        "media-playlist-shuffle-symbolic",
-        18,
-    )));
-    describe_control(&shuffle, "Перемешать");
-    shuffle.style_context().add_class("transport-button");
-    shuffle.set_active(model.borrow().shuffle);
-    let prev = gtk::Button::new();
-    prev.set_focus_on_click(false);
-    prev.set_image(Some(&symbolize("media-skip-backward-symbolic", 18)));
-    describe_control(&prev, "Предыдущий трек");
-    prev.style_context().add_class("transport-button");
-    let play = gtk::Button::new();
-    play.set_focus_on_click(false);
-    let play_icons = gtk::Stack::new();
-    play_icons.set_transition_type(gtk::StackTransitionType::Crossfade);
-    play_icons.set_transition_duration(140);
-    play_icons.add_named(&symbolize("media-playback-start-symbolic", 28), "play");
-    play_icons.add_named(&symbolize("media-playback-pause-symbolic", 28), "pause");
-    play_icons.set_visible_child_name("play");
-    play.add(&play_icons);
-    describe_control(&play, "Воспроизвести");
-    play.style_context().add_class("play-fab");
-    let next = gtk::Button::new();
-    next.set_focus_on_click(false);
-    next.set_image(Some(&symbolize("media-skip-forward-symbolic", 18)));
-    describe_control(&next, "Следующий трек");
-    next.style_context().add_class("transport-button");
-    let repeat = gtk::Button::new();
-    repeat.set_focus_on_click(false);
-    let repeat_icons = gtk::Stack::new();
-    repeat_icons.set_transition_type(gtk::StackTransitionType::Crossfade);
-    repeat_icons.set_transition_duration(150);
-    repeat_icons.add_named(&symbolize("media-playlist-repeat-symbolic", 18), "all");
-    let repeat_one = if gtk::IconTheme::default()
-        .is_some_and(|theme| theme.has_icon("media-playlist-repeat-song-symbolic"))
-    {
-        symbolize("media-playlist-repeat-song-symbolic", 18).upcast::<gtk::Widget>()
-    } else {
-        let icon = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        icon.add(&symbolize("media-playlist-repeat-symbolic", 18));
-        icon.add(&gtk::Label::new(Some("1")));
-        icon.upcast()
-    };
-    repeat_icons.add_named(&repeat_one, "one");
-    repeat.add(&toggle_content(&repeat_icons));
-    repeat.style_context().add_class("transport-button");
-    let transport = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    transport.style_context().add_class("transport");
-    transport.set_halign(gtk::Align::Center);
-    transport.set_valign(gtk::Align::Center);
-    transport.pack_start(&shuffle, false, false, 0);
-    transport.pack_start(&prev, false, false, 0);
-    transport.pack_start(&play, false, false, 0);
-    transport.pack_start(&next, false, false, 0);
-    transport.pack_start(&repeat, false, false, 0);
-    row.set_center_widget(Some(&transport));
-
-    let volume_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    volume_box.style_context().add_class("volume-group");
-    volume_box.set_halign(gtk::Align::End);
-    volume_box.set_valign(gtk::Align::Center);
-    let volume_icon = symbolize("audio-volume-high-symbolic", 18);
-    volume_icon.style_context().add_class("muted-icon");
-    let volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
-    volume.set_value(model.borrow().volume);
-    volume.set_draw_value(false);
-    describe_control(&volume, "Громкость");
-    volume.set_size_request(104, -1);
-    volume.style_context().add_class("volume");
-    volume_box.pack_start(&volume_icon, false, false, 0);
-    volume_box.pack_start(&volume, false, false, 0);
-    row.pack_end(&volume_box, false, false, 0);
-    panel.pack_start(&row, false, false, 0);
-    panel.pack_start(&seek_row, false, false, 0);
-
-    apply_repeat_label(&repeat, model.borrow().repeat);
-
-    let m = model.clone();
-    play.connect_clicked(move |button| {
-        let selected = {
-            let state = m.borrow();
-            state
-                .current
-                .or_else(|| (!state.tracks.is_empty()).then_some(0))
-        };
-        if let Some(index) = selected.filter(|_| {
-            m.borrow()
-                .mpv
-                .as_ref()
-                .map(|player| !player.loaded)
-                .unwrap_or(true)
-        }) {
-            play_index(&m, index);
-            return;
-        }
-        let mut state = m.borrow_mut();
-        if let Some(player) = state.mpv.as_mut() {
-            let _ = player.command(json!(["cycle", "pause"]));
-            player.paused = !player.paused;
-            set_play_icon(button, player.loaded && !player.paused);
-        }
-    });
-    let m = model.clone();
-    next.connect_clicked(move |_| next_track(&m, 1, false));
-    let m = model.clone();
-    prev.connect_clicked(move |_| next_track(&m, -1, false));
-    let m = model.clone();
-    shuffle.connect_toggled(move |button| {
-        let mut state = m.borrow_mut();
-        state.shuffle = button.is_active();
-        state.shuffle_order = ShuffleOrder::default();
-        drop(state);
-        save_session(&m);
-    });
-    let m = model.clone();
-    repeat.connect_clicked(move |button| {
-        let mut state = m.borrow_mut();
-        state.repeat = (state.repeat + 1) % 3;
-        let mode = state.repeat;
-        drop(state);
-        apply_repeat_label(button, mode);
-        let mut state = m.borrow_mut();
-        let loop_one = state.repeat == 2;
-        if let Some(player) = state.mpv.as_mut() {
-            let _ = player.command(json!([
-                "set_property",
-                "loop-file",
-                if loop_one { "inf" } else { "no" }
-            ]));
-        }
-        drop(state);
-        save_session(&m);
-    });
-    let m = model.clone();
-    let volume_save = Rc::new(RefCell::new(None));
-    volume.connect_value_changed(move |scale| {
-        let value = scale.value();
-        let mut state = m.borrow_mut();
-        state.volume = value;
-        if let Some(player) = state.mpv.as_mut() {
-            let _ = player.command(json!(["set_property", "volume", value]));
-        }
-        drop(state);
-        schedule_session_save(&m, &volume_save);
-    });
-    let m = model.clone();
-    let time_clone = time.clone();
-    seek.connect_change_value(move |_, _, value| {
-        let mut state = m.borrow_mut();
-        if let Some(player) = state.mpv.as_mut() {
-            let at = player.duration * value / 1000.0;
-            if player.loaded
-                && player
-                    .command(json!(["seek", at, "absolute+exact"]))
-                    .is_ok()
-            {
-                if player.paused {
-                    player.paused_lyric_position = Some(at);
-                }
-                player.set_position(at);
-                time_clone.set_text(&format_time(at));
-            }
-        }
-        glib::Propagation::Proceed
-    });
-    let m = model.clone();
-    let now_clone = now.clone();
-    let now_artist_clone = now_artist.clone();
-    let seek_tick = seek.clone();
-    let time_tick = time.clone();
-    let duration_tick = duration.clone();
-    let play_tick = play.clone();
-    let small_image_tick = small_image.clone();
-    let small_stack_tick = small_stack.clone();
-    let alive = widget_lifetime(&panel);
-    let mut rendered_cover = None;
-    let mut rendered_track: Option<(PathBuf, String, String)> = None;
-    let mut rendered_time = None;
-    let mut rendered_duration = None;
-    let mut rendered_playing: Option<bool> = None;
-    let animation = Rc::new(Cell::new(false));
-    glib::timeout_add_local(Duration::from_millis(120), move || {
-        if !alive.get() {
-            return glib::ControlFlow::Break;
-        }
-        let state = m.borrow();
-        if let Some(index) = state.current {
-            if let Some(track) = state.tracks.get(index) {
-                if rendered_track
-                    .as_ref()
-                    .map(|(path, title, artist)| (path, title, artist))
-                    != Some((&track.path, &track.title, &track.artist))
-                {
-                    rendered_track = Some((
-                        track.path.clone(),
-                        track.title.clone(),
-                        track.artist.clone(),
-                    ));
-                    now_clone.set_text(&track.title);
-                    now_clone.set_tooltip_text(Some(&track.title));
-                    now_artist_clone.set_text(&track.artist);
-                    now_artist_clone.set_tooltip_text(Some(&track.artist));
-                }
-                if let Some(image) =
-                    current_artwork(track, &mut rendered_cover, &state.cover_pending)
-                {
-                    crossfade_cover(
-                        &small_stack_tick,
-                        &small_image_tick,
-                        &small_alt,
-                        image.as_ref().and_then(|art| art.mini.as_ref()),
-                    );
-                    theme::set_hue(image.and_then(|art| art.hue));
-                }
-            }
-        }
-        if state.current.is_none() {
-            if rendered_track.take().is_some() {
-                now_clone.set_text("Трек не выбран");
-                now_artist_clone.set_text("");
-                now_clone.set_tooltip_text(None);
-                now_artist_clone.set_tooltip_text(None);
-            }
-            if rendered_cover.take().is_some() {
-                small_stack_tick.set_visible_child_name("placeholder");
-                theme::set_hue(None);
-            }
-        }
-        let available = !state.tracks.is_empty() && state.mpv.is_some();
-        for (widget, sensitive) in [
-            (play_tick.upcast_ref::<gtk::Widget>(), available),
-            (
-                prev.upcast_ref(),
-                available && (!state.shuffle || state.shuffle_order.has_previous()),
-            ),
-            (next.upcast_ref(), available && can_advance(&state)),
-            (
-                seek_tick.upcast_ref(),
-                state
-                    .mpv
-                    .as_ref()
-                    .is_some_and(|p| p.loaded && p.duration > 0.0),
-            ),
-        ] {
-            if widget.is_sensitive() != sensitive {
-                widget.set_sensitive(sensitive);
-            }
-        }
-        let player = state.mpv.as_ref();
-        let position = player.map_or(0.0, |player| player.position(state.speed));
-        let second = position as u64;
-        if rendered_time != Some(second) {
-            rendered_time = Some(second);
-            time_tick.set_text(&format_time(position));
-        }
-        let duration = player.map_or(0.0, |p| p.duration);
-        if rendered_duration != Some(duration as u64) {
-            rendered_duration = Some(duration as u64);
-            duration_tick.set_text(&format_time(duration));
-        }
-        let playing = player.is_some_and(|p| p.loaded && !p.paused);
-        if rendered_playing != Some(playing) {
-            rendered_playing = Some(playing);
-            set_play_icon(&play_tick, playing);
-        }
-        if playing && duration > 0.0 && seek_tick.is_mapped() && animations_enabled() {
-            if !animation.replace(true) {
-                let active = animation.clone();
-                let model = m.clone();
-                seek_tick.add_tick_callback(move |scale, _| {
-                    let state = model.borrow();
-                    if let Some(player) = state.mpv.as_ref().filter(|player| {
-                        player.loaded
-                            && !player.paused
-                            && player.duration > 0.0
-                            && scale.is_mapped()
-                            && animations_enabled()
-                    }) {
-                        update_seek_display(scale, player.position(state.speed), player.duration);
-                        return glib::ControlFlow::Continue;
-                    }
-                    active.set(false);
-                    glib::ControlFlow::Break
-                });
-            }
-        } else {
-            update_seek_display(&seek_tick, position, duration);
-        }
-        glib::ControlFlow::Continue
-    });
-    panel.upcast()
-}
-
-fn update_seek_display(scale: &gtk::Scale, position: f64, duration: f64) {
-    if scale.has_grab() {
-        return;
-    }
-    let value = if duration > 0.0 {
-        (position / duration * 1000.0).clamp(0.0, 1000.0)
-    } else {
-        0.0
-    };
-    if (scale.value() - value).abs() >= 0.05 || (value == 0.0 && scale.value() != 0.0) {
-        scale.set_value(value);
-    }
-}
-
-fn set_play_icon(button: &gtk::Button, playing: bool) {
-    describe_control(
-        button,
-        if playing {
-            "Пауза"
-        } else {
-            "Воспроизвести"
-        },
-    );
-    set_style_class(button, "playing", playing);
-    if let Some(icons) = button
-        .child()
-        .and_then(|child| child.downcast::<gtk::Stack>().ok())
-    {
-        icons.set_visible_child_name(if playing { "pause" } else { "play" });
-    }
-}
-
-fn toggle_content(image: &impl IsA<gtk::Widget>) -> gtk::Overlay {
-    let overlay = gtk::Overlay::new();
-    overlay.set_halign(gtk::Align::Fill);
-    overlay.set_valign(gtk::Align::Fill);
-    image.set_halign(gtk::Align::Center);
-    image.set_valign(gtk::Align::Center);
-    overlay.add(image);
-    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    dot.style_context().add_class("transport-indicator");
-    dot.set_size_request(4, 4);
-    dot.set_halign(gtk::Align::Center);
-    dot.set_valign(gtk::Align::End);
-    dot.set_margin_bottom(5);
-    overlay.add_overlay(&dot);
-    overlay.set_overlay_pass_through(&dot, true);
-    overlay
-}
-
-fn apply_repeat_label(button: &gtk::Button, mode: usize) {
-    let (tooltip, active) = match mode {
-        1 => ("Повторять очередь", true),
-        2 => ("Повторять трек", true),
-        _ => ("Без повтора", false),
-    };
-    describe_control(button, tooltip);
-    if let Some(icons) = button
-        .child()
-        .and_then(|child| child.downcast::<gtk::Overlay>().ok())
-        .and_then(|overlay| overlay.child())
-        .and_then(|child| child.downcast::<gtk::Stack>().ok())
-    {
-        icons.set_visible_child_name(if mode == 2 { "one" } else { "all" });
-    }
-    set_style_class(button, "active", active);
-}
-
 fn start_mpv(model: &Rc<RefCell<Model>>) {
+    request_ui(model);
     let Some((child, path)) = Mpv::spawn() else {
         model.borrow_mut().status =
             Some("Не удалось запустить mpv. Проверь, что он установлен.".into());
         return;
     };
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(Mpv::connect(child, path));
-    });
+    let task = gtk::gio::spawn_blocking(move || Mpv::connect(child, path));
     let model = Rc::downgrade(model);
-    glib::timeout_add_local(Duration::from_millis(30), move || {
-        let Some(model) = model.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        match receiver.try_recv() {
-            Ok(Some(mut player)) => {
+    glib::MainContext::default().spawn_local(async move {
+        let connected = task.await.ok().flatten();
+        let Some(model) = model.upgrade() else { return };
+        match connected {
+            Some(mut player) => {
                 let mut state = model.borrow_mut();
-                let _ = player.command(json!(["set_property", "volume", state.volume]));
+                let _ = player.set_volume(state.volume);
+                let _ = player.set_muted(state.muted);
                 let _ = player.command(json!(["set_property", "speed", state.speed]));
                 let _ = player.command(json!([
                     "set_property",
@@ -2457,34 +1999,50 @@ fn start_mpv(model: &Rc<RefCell<Model>>) {
                     },
                 ));
                 state.mpv = Some(player);
-                let model = Rc::downgrade(&model);
-                // Retry queued writes if mpv has not made room for them yet.
-                glib::timeout_add_local(Duration::from_millis(160), move || {
-                    let Some(model) = model.upgrade() else {
-                        return glib::ControlFlow::Break;
-                    };
-                    let pending = model.borrow().mpv.as_ref().map(Mpv::has_outgoing);
-                    match pending {
-                        Some(true) => tick_mpv(&model),
-                        Some(false) => {}
-                        None => return glib::ControlFlow::Break,
-                    }
-                    glib::ControlFlow::Continue
-                });
+                state.updates.request();
             }
-            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                model.borrow_mut().status =
-                    Some("Не удалось запустить mpv. Проверь, что он установлен.".into());
+            None => {
+                let mut state = model.borrow_mut();
+                state.status = Some("Не удалось запустить mpv. Проверь, что он установлен.".into());
+                state.updates.request();
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
         }
-        glib::ControlFlow::Break
     });
+}
+
+fn arm_mpv_writes(model: &Rc<RefCell<Model>>) {
+    let mut state = model.borrow_mut();
+    let Some(player) = state
+        .mpv
+        .as_mut()
+        .filter(|p| p.has_outgoing() && p.write_source.is_none())
+    else {
+        return;
+    };
+    let model = Rc::downgrade(model);
+    player.write_source = Some(glib::unix_fd_add_local(
+        player.socket_fd(),
+        glib::IOCondition::OUT,
+        move |_, _| {
+            let Some(model) = model.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            tick_mpv(&model);
+            if let Some(player) = model.borrow_mut().mpv.as_mut() {
+                if player.has_outgoing() {
+                    return glib::ControlFlow::Continue;
+                }
+                player.write_source.take();
+            }
+            glib::ControlFlow::Break
+        },
+    ));
 }
 
 fn tick_mpv(model: &Rc<RefCell<Model>>) {
     let (ended, failed) = {
         let mut state = model.borrow_mut();
+        state.updates.request_progress();
         let Some(player) = state.mpv.as_mut() else {
             return;
         };
@@ -2495,10 +2053,18 @@ fn tick_mpv(model: &Rc<RefCell<Model>>) {
             ));
             return;
         }
+        let volume = player.volume.take();
+        let muted = player.muted.take();
         let ended = std::mem::take(&mut player.ended);
         let failed = std::mem::take(&mut player.failed);
         if let Some(error) = player.error.take() {
             state.status = Some(error);
+        }
+        if let Some(volume) = volume {
+            state.volume = volume.clamp(0.0, 100.0);
+        }
+        if let Some(muted) = muted {
+            state.muted = muted;
         }
         (ended, failed)
     };
@@ -2532,6 +2098,7 @@ fn play_index(model: &Rc<RefCell<Model>>, index: usize) {
 
 fn load_index(model: &Rc<RefCell<Model>>, index: usize) {
     let mut state = model.borrow_mut();
+    state.updates.request();
     if index >= state.tracks.len() {
         return;
     }
@@ -2552,6 +2119,7 @@ fn load_index(model: &Rc<RefCell<Model>>, index: usize) {
             .command(json!(["loadfile", mpv_path, "replace"]))
             .is_ok()
         {
+            player.generation = player.generation.wrapping_add(1);
             player.set_position(0.0);
             player.duration = 0.0;
             player.ended = false;
@@ -2577,6 +2145,7 @@ fn load_index(model: &Rc<RefCell<Model>>, index: usize) {
         start_metadata_job(model, vec![path.clone()]);
     }
     start_cover_job(model, path);
+    start_lyrics_job(model, false);
 }
 
 fn next_track(model: &Rc<RefCell<Model>>, direction: isize, automatic: bool) {
@@ -2678,6 +2247,7 @@ fn next_index(current: usize, count: usize, direction: isize, repeat: usize) -> 
 
 fn stop_playback(model: &Rc<RefCell<Model>>) {
     let mut state = model.borrow_mut();
+    state.updates.request();
     if let Some(player) = state.mpv.as_mut() {
         let _ = player.command(json!(["stop"]));
         player.paused = true;
@@ -2691,6 +2261,7 @@ fn append_paths(model: &Rc<RefCell<Model>>, paths: Vec<PathBuf>) {
     {
         let mut state = model.borrow_mut();
         state.imports_pending += 1;
+        state.updates.request();
         state.status = None;
     }
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -2713,6 +2284,7 @@ fn append_paths(model: &Rc<RefCell<Model>>, paths: Vec<PathBuf>) {
             Ok((paths, unsupported)) => {
                 let mut state = model_result.borrow_mut();
                 state.imports_pending = state.imports_pending.saturating_sub(1);
+                state.updates.request();
                 let found = !paths.is_empty();
                 let skipped = || format!("Пропущено файлов с именами вне UTF-8: {unsupported}.");
                 let mut fresh = Vec::new();
@@ -2756,6 +2328,7 @@ fn append_paths(model: &Rc<RefCell<Model>>, paths: Vec<PathBuf>) {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 let mut state = model_result.borrow_mut();
                 state.imports_pending = state.imports_pending.saturating_sub(1);
+                state.updates.request();
                 state.status = Some("Импорт прервался. Попробуй добавить файлы ещё раз.".into());
                 glib::ControlFlow::Break
             }
@@ -2795,11 +2368,10 @@ fn restore_session(model: &Rc<RefCell<Model>>) {
     state.shuffle = saved.shuffle;
     state.repeat = saved.repeat.min(2);
     state.online_covers = saved.online_covers;
+    state.muted = saved.muted;
+    state.appearance = saved.appearance;
     state.volume = saved.volume.clamp(0.0, 100.0);
     state.speed = saved.speed.clamp(0.5, 2.0);
-    if let Some(dir) = saved.soundcloud_dir {
-        state.soundcloud_dir = dir;
-    }
     state.library_revision += 1;
     let current_path = state
         .current
@@ -2847,7 +2419,17 @@ fn start_metadata_job(model: &Rc<RefCell<Model>>, mut paths: Vec<PathBuf>) {
             match receiver.try_recv() {
                 Ok(track) => {
                     let mut state = model_result.borrow_mut();
+                    let selected = state
+                        .current
+                        .and_then(|index| state.tracks.get(index))
+                        .filter(|current| current.path == track.path)
+                        .map(|current| current.path.clone());
                     merge_metadata(&mut state, &indices, track);
+                    drop(state);
+                    if let Some(path) = selected {
+                        start_cover_job(&model_result, path);
+                        start_lyrics_job(&model_result, false);
+                    }
                     received += 1;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
@@ -2884,12 +2466,19 @@ fn merge_metadata(
     if let Some(index) = index {
         let existing = &mut state.tracks[index];
         track.cover_path = existing.cover_path.take();
+        if track.cover_path.is_none()
+            && state.online_covers
+            && (existing.title != track.title || existing.artist != track.artist)
+        {
+            state.cover_attempted.remove(&track.path);
+        }
         if track.lyrics.is_empty() {
             track.lyrics = std::mem::take(&mut existing.lyrics);
         }
         state.metadata_ready.insert(track.path.clone());
         *existing = track;
         state.queue_metadata_changed.insert(index);
+        state.updates.request();
     }
 }
 
@@ -2918,24 +2507,20 @@ fn start_lyrics_job(model: &Rc<RefCell<Model>>, retry: bool) {
         }
         let track = track.clone();
         state.lyrics_pending.insert(path);
+        state.updates.request();
         track
     };
     let path = track.path.clone();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(online_lyrics(&track));
-    });
-    let model = model.clone();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        let result = match receiver.try_recv() {
-            Ok(result) => result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err("Поиск прервался. Нажми «Искать снова».".into())
-            }
-        };
+    let task = gtk::gio::spawn_blocking(move || online_lyrics(&track));
+    let model = Rc::downgrade(model);
+    glib::MainContext::default().spawn_local(async move {
+        let result = task
+            .await
+            .unwrap_or_else(|_| Err("Поиск прервался. Нажми «Искать снова».".into()));
+        let Some(model) = model.upgrade() else { return };
         let mut state = model.borrow_mut();
         state.lyrics_pending.remove(&path);
+        state.updates.request();
         let message = match result {
             Ok(lines) if !lines.is_empty() => {
                 if let Some(track) = state.tracks.iter_mut().find(|track| track.path == path) {
@@ -2949,7 +2534,8 @@ fn start_lyrics_job(model: &Rc<RefCell<Model>>, retry: bool) {
             Err(error) => error,
         };
         state.lyrics_results.insert(path.clone(), message);
-        glib::ControlFlow::Break
+        drop(state);
+        start_lyrics_job(&model, false);
     });
 }
 
@@ -2964,48 +2550,48 @@ fn start_cover_job(model: &Rc<RefCell<Model>>, path: PathBuf) {
         else {
             return;
         };
-        if selected.cover_path.is_some() || !state.cover_pending.insert(path.clone()) {
+        if selected.cover_path.is_some()
+            || state.cover_attempted.contains(&path)
+            || !state.cover_pending.insert(path.clone())
+        {
             return;
         }
         state.cover_attempted.insert(path.clone());
+        state.updates.request();
         (selected, state.online_covers)
     };
-    let (sender, receiver) = std::sync::mpsc::channel();
     let lookup_identity = (selected.title.clone(), selected.artist.clone());
-    std::thread::spawn(move || {
-        let local = extract_cover(&selected.path);
-        let cover = if local.is_some() || !online {
-            local
-        } else {
-            cover_art::online_cover(&selected)
-        };
-        let _ = sender.send(cover);
+    let task = gtk::gio::spawn_blocking(move || {
+        extract_cover(&selected.path)
+            .or_else(|| online.then(|| cover_art::online_cover(&selected)).flatten())
     });
-    let model_result = model.clone();
-    glib::timeout_add_local(Duration::from_millis(35), move || {
-        match receiver.try_recv() {
-            Ok(cover) => {
-                let mut state = model_result.borrow_mut();
-                state.cover_pending.remove(&path);
-                let mut retry = false;
-                if let Some(track) = state.tracks.iter_mut().find(|track| track.path == path) {
-                    retry = cover.is_none()
-                        && online
-                        && (track.title.as_str(), track.artist.as_str())
-                            != (lookup_identity.0.as_str(), lookup_identity.1.as_str());
-                    track.cover_path = cover;
-                }
-                drop(state);
-                if retry {
-                    start_cover_job(&model_result, path.clone());
-                }
-                glib::ControlFlow::Break
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                model_result.borrow_mut().cover_pending.remove(&path);
-                glib::ControlFlow::Break
-            }
+    let model = Rc::downgrade(model);
+    glib::MainContext::default().spawn_local(async move {
+        let result = task.await;
+        let Some(model) = model.upgrade() else { return };
+        let mut state = model.borrow_mut();
+        state.cover_pending.remove(&path);
+        state.updates.request();
+        let Ok(cover) = result else {
+            state.cover_attempted.remove(&path);
+            return;
+        };
+        let allow_online = state.online_covers;
+        let mut retry = false;
+        if let Some(track) = state.tracks.iter_mut().find(|track| track.path == path) {
+            retry = cover.is_none()
+                && allow_online
+                && (!online
+                    || (track.title.as_str(), track.artist.as_str())
+                        != (lookup_identity.0.as_str(), lookup_identity.1.as_str()));
+            track.cover_path = cover;
+        }
+        if retry {
+            state.cover_attempted.remove(&path);
+            drop(state);
+            start_cover_job(&model, path);
+        } else {
+            state.cover_attempted.insert(path);
         }
     });
 }
@@ -3044,16 +2630,17 @@ fn save_session(model: &Rc<RefCell<Model>>) {
         shuffle: state.shuffle,
         repeat: state.repeat,
         online_covers: state.online_covers,
+        muted: state.muted,
+        appearance: state.appearance,
         volume: state.volume,
         speed: state.speed,
-        soundcloud_dir: Some(state.soundcloud_dir.clone()),
     };
     if let Err(error) = session::save(saved) {
         eprintln!("Не удалось сохранить очередь: {error}");
     }
 }
 
-fn build_settings_page(model: &Rc<RefCell<Model>>) -> gtk::ScrolledWindow {
+fn build_settings_page(model: &Rc<RefCell<Model>>, sidebar: &gtk::Box) -> gtk::ScrolledWindow {
     let scroll = gtk::ScrolledWindow::new(gtk::Adjustment::NONE, gtk::Adjustment::NONE);
     scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroll.set_overlay_scrolling(true);
@@ -3088,6 +2675,7 @@ fn build_settings_page(model: &Rc<RefCell<Model>>) -> gtk::ScrolledWindow {
             {
                 let mut state = model.borrow_mut();
                 state.speed = value;
+                state.updates.request();
                 if let Some(player) = state.mpv.as_mut() {
                     let _ = player.command(json!(["set_property", "speed", value]));
                 }
@@ -3137,6 +2725,58 @@ fn build_settings_page(model: &Rc<RefCell<Model>>) -> gtk::ScrolledWindow {
     }
     speed_block.pack_start(&presets, false, false, 0);
     playback.pack_start(&speed_block, false, false, 0);
+
+    let appearance = settings_section(&content, "Интерфейс");
+    let saved = model.borrow().appearance;
+    let background = settings_switch(
+        &appearance,
+        "Динамический фон",
+        "Слегка тонировать область плеера цветом обложки.",
+        saved.dynamic_background,
+    );
+    background.connect_active_notify({
+        let model = model.clone();
+        move |switch| {
+            model.borrow_mut().appearance.dynamic_background = switch.is_active();
+            theme::set_dynamic(switch.is_active());
+            request_ui(&model);
+            save_session(&model);
+        }
+    });
+    let animations = settings_switch(
+        &appearance,
+        "Анимации",
+        "Плавные переходы между обложками, экранами и состояниями кнопок.",
+        saved.animations,
+    );
+    animations.connect_active_notify({
+        let model = model.clone();
+        move |switch| {
+            model.borrow_mut().appearance.animations = switch.is_active();
+            set_decorative_motion(switch.is_active());
+            if let Some(window) = switch.toplevel() {
+                sync_stack_motion(&window);
+            }
+            save_session(&model);
+        }
+    });
+    let expanded = settings_switch(
+        &appearance,
+        "Расширенная боковая панель",
+        "Показывать названия разделов рядом с иконками.",
+        saved.expanded_sidebar,
+    );
+    expanded.connect_active_notify({
+        let model = model.clone();
+        let sidebar = sidebar.downgrade();
+        move |switch| {
+            model.borrow_mut().appearance.expanded_sidebar = switch.is_active();
+            if let Some(sidebar) = sidebar.upgrade() {
+                apply_sidebar_mode(&sidebar, switch.is_active());
+            }
+            save_session(&model);
+        }
+    });
 
     let library = settings_section(&content, "Библиотека");
     let (cover_row, _) = settings_row(
@@ -3269,6 +2909,20 @@ fn build_settings_page(model: &Rc<RefCell<Model>>) -> gtk::ScrolledWindow {
     scroll
 }
 
+fn settings_switch(section: &gtk::Box, title: &str, note: &str, active: bool) -> gtk::Switch {
+    if !section.children().is_empty() {
+        section.add(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    }
+    let (row, _) = settings_row(title, note);
+    let control = gtk::Switch::new();
+    control.set_active(active);
+    control.set_valign(gtk::Align::Center);
+    describe_control(&control, title);
+    row.pack_end(&control, false, false, 0);
+    section.add(&row);
+    control
+}
+
 fn settings_text(text: &str, class: &str) -> gtk::Label {
     let label = gtk::Label::new(Some(text));
     label.set_xalign(0.0);
@@ -3302,665 +2956,6 @@ fn settings_row(title: &str, note: &str) -> (gtk::Box, gtk::Label) {
     labels.pack_start(&note, false, false, 0);
     row.pack_start(&labels, true, true, 0);
     (row, note)
-}
-
-fn show_soundcloud_dialog(model: &Rc<RefCell<Model>>) {
-    let dialog = gtk::Dialog::with_buttons(
-        Some("Скачать с SoundCloud"),
-        active_window().as_ref(),
-        gtk::DialogFlags::MODAL,
-        &[("Закрыть", gtk::ResponseType::Close)],
-    );
-    dialog.set_default_size(580, 460);
-    dialog.set_resizable(false);
-    dialog.style_context().add_class("settings-dialog");
-    let content = dialog.content_area();
-    content.set_margin_top(16);
-    content.set_margin_bottom(12);
-    content.set_margin_start(24);
-    content.set_margin_end(24);
-    content.set_spacing(10);
-
-    let heading = gtk::Label::new(Some("Скачать с SoundCloud"));
-    heading.set_xalign(0.0);
-    heading.style_context().add_class("heading");
-    content.pack_start(&heading, false, false, 0);
-
-    let note = gtk::Label::new(Some(
-        "Скачиваются только оригиналы треков, которые автор разрешил скачивать. Стримы, обход DRM и ограничений не используются.",
-    ));
-    note.set_line_wrap(true);
-    note.set_max_width_chars(52);
-    note.set_xalign(0.0);
-    note.style_context().add_class("settings-note");
-    content.pack_start(&note, false, false, 0);
-
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    card.style_context().add_class("settings-card");
-    let url_label = gtk::Label::new(Some("Ссылка на трек"));
-    url_label.set_xalign(0.0);
-    url_label.style_context().add_class("settings-label");
-    card.pack_start(&url_label, false, false, 0);
-    let url = gtk::Entry::new();
-    url.set_placeholder_text(Some("https://soundcloud.com/artist/track"));
-    url.set_activates_default(false);
-    card.pack_start(&url, false, false, 0);
-
-    let folder_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let folder_title = gtk::Label::new(Some("Папка"));
-    folder_title.set_xalign(0.0);
-    folder_title.style_context().add_class("settings-label");
-    let folder_value = gtk::Label::new(None);
-    folder_value.set_xalign(1.0);
-    folder_value.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    folder_value.set_max_width_chars(30);
-    folder_value.style_context().add_class("settings-note");
-    let folder_button = gtk::Button::with_label("Изменить…");
-    folder_button.style_context().add_class("ghost-button");
-    folder_header.pack_start(&folder_title, false, false, 0);
-    folder_header.pack_start(&folder_value, true, true, 0);
-    folder_header.pack_start(&folder_button, false, false, 0);
-    card.pack_start(&folder_header, false, false, 0);
-    let initial_dir = model.borrow().soundcloud_dir.clone();
-    folder_value.set_text(&initial_dir.to_string_lossy());
-
-    let auth_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let auth_title = gtk::Label::new(Some("Доступ"));
-    auth_title.set_xalign(0.0);
-    auth_title.style_context().add_class("settings-label");
-    let auth_status = gtk::Label::new(None);
-    refresh_token_summary(&auth_status);
-    auth_status.set_xalign(1.0);
-    auth_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    auth_status.style_context().add_class("settings-note");
-    let auth_button = gtk::Button::with_label("Авторизация…");
-    auth_button.style_context().add_class("ghost-button");
-    auth_header.pack_start(&auth_title, false, false, 0);
-    auth_header.pack_start(&auth_status, true, true, 0);
-    auth_header.pack_start(&auth_button, false, false, 0);
-    card.pack_start(&auth_header, false, false, 0);
-    content.pack_start(&card, false, false, 0);
-
-    let progress = gtk::ProgressBar::new();
-    progress.set_show_text(true);
-    progress.set_text(Some("Готов к загрузке"));
-    content.pack_start(&progress, false, false, 0);
-
-    let status = gtk::Label::new(Some("Вставь ссылку на трек и нажми «Скачать»."));
-    status.set_xalign(0.0);
-    status.set_line_wrap(true);
-    status.set_max_width_chars(54);
-    status.set_selectable(true);
-    status.style_context().add_class("download-status");
-    content.pack_start(&status, false, false, 0);
-
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    actions.set_homogeneous(false);
-    let cancel = gtk::Button::with_label("Отменить");
-    cancel.style_context().add_class("ghost-button");
-    cancel.set_no_show_all(true);
-    cancel.set_visible(false);
-    let download = gtk::Button::with_label("Скачать");
-    download.style_context().add_class("tonal-button");
-    let library = gtk::Button::with_label("Вся библиотека");
-    library.style_context().add_class("ghost-button");
-    library.set_tooltip_text(Some(
-        "Скачать все треки из лайков, плейлистов и своих загрузок, которые авторы разрешили скачивать",
-    ));
-    actions.pack_end(&download, false, false, 0);
-    actions.pack_end(&library, false, false, 0);
-    actions.pack_end(&cancel, false, false, 0);
-    content.pack_start(&actions, false, false, 4);
-
-    let model_folder = model.clone();
-    let folder_value_change = folder_value.clone();
-    folder_button.connect_clicked(move |_| {
-        let current = model_folder.borrow().soundcloud_dir.clone();
-        let chooser = gtk::FileChooserDialog::with_buttons(
-            Some("Папка для загрузок"),
-            active_window().as_ref(),
-            gtk::FileChooserAction::SelectFolder,
-            &[
-                ("Отмена", gtk::ResponseType::Cancel),
-                ("Выбрать", gtk::ResponseType::Accept),
-            ],
-        );
-        chooser.set_filename(&current);
-        let selected = if chooser.run() == gtk::ResponseType::Accept {
-            chooser.filename()
-        } else {
-            None
-        };
-        chooser.close();
-        if let Some(path) = selected {
-            model_folder.borrow_mut().soundcloud_dir = path.clone();
-            folder_value_change.set_text(&path.to_string_lossy());
-            save_session(&model_folder);
-        }
-    });
-
-    let auth_status_refresh = auth_status.clone();
-    let auth_window = dialog.clone();
-    auth_button.connect_clicked(move |_| {
-        show_soundcloud_token_dialog(&auth_window);
-        refresh_token_summary(&auth_status_refresh);
-    });
-
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let receiver = Rc::new(RefCell::new(receiver));
-    let job: Rc<RefCell<Option<soundcloud::Job>>> = Rc::new(RefCell::new(None));
-    let busy = Rc::new(Cell::new(false));
-    let batch = Rc::new(Cell::new(false));
-    let collected: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
-
-    let model_start = model.clone();
-    let url_start = url.clone();
-    let status_start = status.clone();
-    let progress_start = progress.clone();
-    let cancel_start = cancel.clone();
-    let download_start = download.clone();
-    let folder_button_start = folder_button.clone();
-    let auth_button_start = auth_button.clone();
-    let library_start = library.clone();
-    let job_start = job.clone();
-    let busy_start = busy.clone();
-    let batch_start = batch.clone();
-    let collected_start = collected.clone();
-    let sender_download = sender.clone();
-    download.connect_clicked(move |_| {
-        if busy_start.get() {
-            return;
-        }
-        let link = url_start.text().trim().to_string();
-        if link.is_empty() {
-            status_start.set_text("Вставь ссылку на трек SoundCloud.");
-            return;
-        }
-        let dir = model_start.borrow().soundcloud_dir.clone();
-        batch_start.set(false);
-        collected_start.borrow_mut().clear();
-        busy_start.set(true);
-        url_start.set_sensitive(false);
-        folder_button_start.set_sensitive(false);
-        auth_button_start.set_sensitive(false);
-        library_start.set_sensitive(false);
-        download_start.set_sensitive(false);
-        cancel_start.set_visible(true);
-        cancel_start.set_sensitive(true);
-        cancel_start.set_label("Отменить");
-        progress_start.set_fraction(0.0);
-        progress_start.set_text(Some("Определяем трек…"));
-        status_start.style_context().remove_class("error");
-        status_start.set_text("Соединяемся с SoundCloud…");
-        let new_job = soundcloud::start(link, dir, sender_download.clone());
-        *job_start.borrow_mut() = Some(new_job);
-    });
-
-    let model_library = model.clone();
-    let url_library = url.clone();
-    let status_library = status.clone();
-    let progress_library = progress.clone();
-    let cancel_library = cancel.clone();
-    let download_library = download.clone();
-    let folder_button_library = folder_button.clone();
-    let auth_button_library = auth_button.clone();
-    let library_self = library.clone();
-    let job_library = job.clone();
-    let busy_library = busy.clone();
-    let batch_library = batch.clone();
-    let collected_library = collected.clone();
-    let dialog_library = dialog.clone();
-    let sender_library = sender.clone();
-    library.connect_clicked(move |_| {
-        if busy_library.get() {
-            return;
-        }
-        let confirm = gtk::MessageDialog::new(
-            Some(&dialog_library),
-            gtk::DialogFlags::MODAL,
-            gtk::MessageType::Question,
-            gtk::ButtonsType::None,
-            "Скачать всю библиотеку?",
-        );
-        confirm.set_secondary_text(Some(
-            "Будут скачаны треки из твоих лайков, плейлистов и загрузок, которые авторы разрешили скачивать. Остальные попадут в отчёт soundcloud-skipped.txt. Это может занять много времени.",
-        ));
-        confirm.add_button("Отмена", gtk::ResponseType::Cancel);
-        confirm.add_button("Скачать", gtk::ResponseType::Accept);
-        let accepted = confirm.run() == gtk::ResponseType::Accept;
-        confirm.close();
-        if !accepted {
-            return;
-        }
-        let dir = model_library.borrow().soundcloud_dir.clone();
-        batch_library.set(true);
-        collected_library.borrow_mut().clear();
-        busy_library.set(true);
-        url_library.set_sensitive(false);
-        folder_button_library.set_sensitive(false);
-        auth_button_library.set_sensitive(false);
-        library_self.set_sensitive(false);
-        download_library.set_sensitive(false);
-        cancel_library.set_visible(true);
-        cancel_library.set_sensitive(true);
-        cancel_library.set_label("Отменить");
-        progress_library.set_fraction(0.0);
-        progress_library.pulse();
-        progress_library.set_text(Some("Читаем библиотеку…"));
-        status_library.style_context().remove_class("error");
-        status_library.set_text("Ищем треки в лайках, плейлистах и загрузках…");
-        let new_job = soundcloud::start_library(dir, sender_library.clone());
-        *job_library.borrow_mut() = Some(new_job);
-    });
-
-    let job_cancel = job.clone();
-    let cancel_status = status.clone();
-    let cancel_button = cancel.clone();
-    cancel.connect_clicked(move |_| {
-        if let Some(job) = job_cancel.borrow().as_ref() {
-            job.cancel();
-            cancel_button.set_sensitive(false);
-            cancel_button.set_label("Отменяем…");
-            cancel_status.set_text("Останавливаем загрузку…");
-        }
-    });
-
-    let running = Rc::new(Cell::new(true));
-    let running_poll = running.clone();
-    let model_poll = model.clone();
-    let url_poll = url.clone();
-    let status_poll = status.clone();
-    let progress_poll = progress.clone();
-    let cancel_poll = cancel.clone();
-    let download_poll = download.clone();
-    let library_poll = library.clone();
-    let folder_button_poll = folder_button.clone();
-    let auth_button_poll = auth_button.clone();
-    let job_poll = job.clone();
-    let busy_poll = busy.clone();
-    let batch_poll = batch.clone();
-    let collected_poll = collected.clone();
-    let batch_total = Rc::new(Cell::new(0usize));
-    let batch_index = Rc::new(Cell::new(0usize));
-    let batch_total_poll = batch_total.clone();
-    let batch_index_poll = batch_index.clone();
-    let receiver_poll = receiver.clone();
-    glib::timeout_add_local(Duration::from_millis(120), move || {
-        if !running_poll.get() {
-            return glib::ControlFlow::Break;
-        }
-        let mut finished = false;
-        loop {
-            let event = match receiver_poll.borrow().try_recv() {
-                Ok(event) => event,
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            };
-            match event {
-                soundcloud::Event::Resolving => {
-                    progress_poll.set_fraction(0.0);
-                    progress_poll.pulse();
-                    progress_poll.set_text(Some("Определяем трек…"));
-                }
-                soundcloud::Event::Meta { title, artist } => {
-                    if !batch_poll.get() {
-                        status_poll.style_context().remove_class("error");
-                        status_poll.set_text(&format!("Найден трек: {artist} — {title}"));
-                    }
-                }
-                soundcloud::Event::Downloading { received, total } => {
-                    if batch_poll.get() {
-                        let index = batch_index_poll.get();
-                        let count = batch_total_poll.get();
-                        if count > 0 {
-                            progress_poll
-                                .set_fraction(index.saturating_sub(1) as f64 / count as f64);
-                            progress_poll.set_text(Some(&format!(
-                                "{index} из {count} — {}",
-                                format_bytes(received)
-                            )));
-                        } else {
-                            progress_poll.pulse();
-                        }
-                        continue;
-                    }
-                    match total.filter(|total| *total > 0) {
-                        Some(total) => {
-                            let fraction = (received as f64 / total as f64).clamp(0.0, 1.0);
-                            progress_poll.set_fraction(fraction);
-                            progress_poll.set_text(Some(&format!(
-                                "{} из {}",
-                                format_bytes(received),
-                                format_bytes(total)
-                            )));
-                        }
-                        None => {
-                            progress_poll.pulse();
-                            progress_poll
-                                .set_text(Some(&format!("Скачано {}", format_bytes(received))));
-                        }
-                    }
-                }
-                soundcloud::Event::Processing => {
-                    progress_poll.pulse();
-                    progress_poll.set_text(Some("Проверяем файл и обложку…"));
-                    status_poll.set_text("Обрабатываем метаданные…");
-                }
-                soundcloud::Event::Done(outcome) => {
-                    if batch_poll.get() {
-                        collected_poll.borrow_mut().push(outcome.path);
-                    } else {
-                        progress_poll.set_fraction(1.0);
-                        progress_poll.set_text(Some("Готово"));
-                        status_poll.style_context().remove_class("error");
-                        if outcome.already {
-                            status_poll.set_text(&format!(
-                                "Этот трек уже скачан: {}",
-                                outcome.path.to_string_lossy()
-                            ));
-                        } else {
-                            status_poll.set_text(&format!(
-                                "Скачано: {} — {}",
-                                outcome.artist,
-                                outcome
-                                    .path
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| outcome.title.clone())
-                            ));
-                        }
-                        append_paths(&model_poll, vec![outcome.path]);
-                        finished = true;
-                    }
-                }
-                soundcloud::Event::LibraryCount(found) => {
-                    progress_poll.pulse();
-                    progress_poll.set_text(Some(&format!("Найдено {found} записей")));
-                }
-                soundcloud::Event::BatchStarted { total, skipped } => {
-                    batch_total_poll.set(total);
-                    batch_index_poll.set(0);
-                    progress_poll.set_fraction(0.0);
-                    progress_poll.set_text(Some(&format!("0 из {total}")));
-                    status_poll.style_context().remove_class("error");
-                    status_poll
-                        .set_text(&format!("К загрузке {total} треков. Пропущено: {skipped}."));
-                }
-                soundcloud::Event::BatchItem {
-                    index,
-                    total,
-                    title,
-                    artist,
-                } => {
-                    batch_index_poll.set(index);
-                    if total > 0 {
-                        progress_poll.set_fraction((index.saturating_sub(1)) as f64 / total as f64);
-                    }
-                    progress_poll.set_text(Some(&format!("{index} из {total}")));
-                    status_poll.set_text(&format!("Скачиваем: {artist} — {title}"));
-                }
-                soundcloud::Event::BatchFinished {
-                    downloaded,
-                    already,
-                    failed,
-                    skipped,
-                    cancelled,
-                    report,
-                } => {
-                    let paths: Vec<PathBuf> = collected_poll.borrow_mut().drain(..).collect();
-                    if !paths.is_empty() {
-                        append_paths(&model_poll, paths);
-                    }
-                    status_poll.style_context().remove_class("error");
-                    let headline = if cancelled {
-                        "Пакетная загрузка остановлена."
-                    } else if downloaded == 0 && already == 0 && failed == 0 {
-                        "Нет треков, доступных для скачивания."
-                    } else {
-                        "Библиотека обработана."
-                    };
-                    let mut text = format!(
-                        "{headline} Скачано: {downloaded}. Уже было: {already}. Пропущено: {skipped}. Ошибок: {failed}."
-                    );
-                    if let Some(report) = report {
-                        text.push_str(&format!(" Отчёт: {}", report.to_string_lossy()));
-                    }
-                    status_poll.set_text(&text);
-                    if cancelled {
-                        progress_poll.set_fraction(0.0);
-                        progress_poll.set_text(Some("Остановлено"));
-                    } else {
-                        progress_poll.set_fraction(1.0);
-                        progress_poll.set_text(Some("Готово"));
-                    }
-                    finished = true;
-                }
-                soundcloud::Event::Failed(message) => {
-                    if batch_poll.get() {
-                        let paths: Vec<PathBuf> = collected_poll.borrow_mut().drain(..).collect();
-                        if !paths.is_empty() {
-                            append_paths(&model_poll, paths);
-                        }
-                    }
-                    progress_poll.set_fraction(0.0);
-                    progress_poll.set_text(Some("Ошибка"));
-                    status_poll.style_context().add_class("error");
-                    status_poll.set_text(&message);
-                    finished = true;
-                }
-                soundcloud::Event::Cancelled => {
-                    if batch_poll.get() {
-                        let paths: Vec<PathBuf> = collected_poll.borrow_mut().drain(..).collect();
-                        if !paths.is_empty() {
-                            append_paths(&model_poll, paths);
-                        }
-                    }
-                    progress_poll.set_fraction(0.0);
-                    progress_poll.set_text(Some("Отменено"));
-                    status_poll.set_text("Загрузка отменена, временные файлы удалены.");
-                    finished = true;
-                }
-            }
-        }
-        if finished {
-            busy_poll.set(false);
-            batch_poll.set(false);
-            url_poll.set_sensitive(true);
-            folder_button_poll.set_sensitive(true);
-            auth_button_poll.set_sensitive(true);
-            library_poll.set_sensitive(true);
-            download_poll.set_sensitive(true);
-            cancel_poll.set_visible(false);
-            job_poll.borrow_mut().take();
-        }
-        glib::ControlFlow::Continue
-    });
-
-    motion::animate_buttons(dialog.upcast_ref());
-    dialog.show_all();
-    cancel.set_visible(false);
-    dialog.run();
-    running.set(false);
-    if let Some(job) = job.borrow().as_ref() {
-        job.cancel();
-    }
-    dialog.close();
-}
-
-fn refresh_token_summary(label: &gtk::Label) {
-    label.set_text("Проверяем доступ…");
-    let label = label.downgrade();
-    glib::MainContext::default().spawn_local(async move {
-        let result = gtk::gio::spawn_blocking(soundcloud::token_summary).await;
-        if let Some(label) = label.upgrade() {
-            label.set_text(result.unwrap_or("Связка ключей недоступна"));
-        }
-    });
-}
-
-fn show_soundcloud_token_dialog(parent: &gtk::Dialog) {
-    let dialog = gtk::Dialog::with_buttons(
-        Some("Доступ к SoundCloud"),
-        Some(parent),
-        gtk::DialogFlags::MODAL,
-        &[("Закрыть", gtk::ResponseType::Close)],
-    );
-    dialog.set_default_size(520, 340);
-    dialog.set_resizable(false);
-    dialog.style_context().add_class("settings-dialog");
-    let content = dialog.content_area();
-    content.set_margin_top(16);
-    content.set_margin_bottom(12);
-    content.set_margin_start(24);
-    content.set_margin_end(24);
-    content.set_spacing(10);
-
-    let heading = gtk::Label::new(Some("Токен сессии"));
-    heading.set_xalign(0.0);
-    heading.style_context().add_class("heading");
-    content.pack_start(&heading, false, false, 0);
-
-    let note = gtk::Label::new(Some(
-        "Токен нужен только для треков с кнопкой Download. Он хранится в связке ключей (secret-tool), не попадает в файлы настроек, журналы и аргументы команд. Если связка недоступна, токен живёт только до закрытия плеера.",
-    ));
-    note.set_line_wrap(true);
-    note.set_max_width_chars(50);
-    note.set_xalign(0.0);
-    note.style_context().add_class("settings-note");
-    content.pack_start(&note, false, false, 0);
-
-    let entry = gtk::Entry::new();
-    entry.set_visibility(false);
-    entry.set_input_purpose(gtk::InputPurpose::Password);
-    entry.set_placeholder_text(Some("Вставь значение токена"));
-    content.pack_start(&entry, false, false, 0);
-
-    let status = gtk::Label::new(None);
-    status.set_xalign(0.0);
-    status.set_line_wrap(true);
-    status.set_max_width_chars(50);
-    status.style_context().add_class("settings-note");
-    content.pack_start(&status, false, false, 0);
-
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let clear = gtk::Button::with_label("Удалить сохранённый");
-    clear.style_context().add_class("ghost-button");
-    let save = gtk::Button::with_label("Сохранить");
-    save.style_context().add_class("tonal-button");
-    buttons.pack_start(&clear, false, false, 0);
-    buttons.pack_end(&save, false, false, 0);
-    content.pack_start(&buttons, false, false, 4);
-
-    let busy = Rc::new(Cell::new(false));
-    let status_initial = status.downgrade();
-    let busy_initial = busy.clone();
-    status.set_text("Проверяем связку ключей…");
-    glib::MainContext::default().spawn_local(async move {
-        let result = gtk::gio::spawn_blocking(soundcloud::token_summary).await;
-        if let Some(status) = status_initial.upgrade().filter(|_| !busy_initial.get()) {
-            if let Ok(summary) = result {
-                if status.text() == "Проверяем связку ключей…" {
-                    status.set_text(summary);
-                }
-            }
-        }
-    });
-
-    let update_access = {
-        let busy = busy.clone();
-        let entry = entry.downgrade();
-        let status = status.downgrade();
-        let buttons = buttons.downgrade();
-        move |token: Option<String>| {
-            if busy.replace(true) {
-                return;
-            }
-            if let Some(entry) = entry.upgrade() {
-                entry.set_text("");
-                entry.set_sensitive(false);
-            }
-            if let Some(buttons) = buttons.upgrade() {
-                buttons.set_sensitive(false);
-            }
-            if let Some(status) = status.upgrade() {
-                status.set_text("Обращаемся к связке ключей…");
-            }
-            let task = gtk::gio::spawn_blocking(move || match token {
-                Some(token) => {
-                    let message = match soundcloud::save_token(&token) {
-                        Ok(()) => "Токен сохранён в связке ключей.".into(),
-                        Err(error) => {
-                            format!("{error} Токен будет действовать только до закрытия плеера.")
-                        }
-                    };
-                    soundcloud::set_session_token(Some(token));
-                    message
-                }
-                None => match soundcloud::clear_stored_token() {
-                    Ok(()) => {
-                        soundcloud::set_session_token(None);
-                        "Сохранённый токен удалён.".into()
-                    }
-                    Err(error) => error,
-                },
-            });
-            let (busy, entry, status, buttons) =
-                (busy.clone(), entry.clone(), status.clone(), buttons.clone());
-            glib::MainContext::default().spawn_local(async move {
-                let message = task
-                    .await
-                    .unwrap_or_else(|_| "Связка ключей недоступна.".into());
-                busy.set(false);
-                if let Some(status) = status.upgrade() {
-                    status.set_text(&message);
-                }
-                if let Some(entry) = entry.upgrade() {
-                    entry.set_sensitive(true);
-                }
-                if let Some(buttons) = buttons.upgrade() {
-                    buttons.set_sensitive(true);
-                }
-            });
-        }
-    };
-
-    let entry_save = entry.clone();
-    let status_save = status.clone();
-    let save_access = update_access.clone();
-    save.connect_clicked(move |_| {
-        let raw = entry_save.text();
-        let token = raw
-            .trim()
-            .strip_prefix("OAuth ")
-            .unwrap_or(raw.trim())
-            .to_string();
-        if let Err(error) = soundcloud::validate_token(&token) {
-            status_save.set_text(&error);
-        } else {
-            save_access(Some(token));
-        }
-    });
-    clear.connect_clicked(move |_| update_access(None));
-
-    motion::animate_buttons(dialog.upcast_ref());
-    dialog.show_all();
-    dialog.run();
-    dialog.close();
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[0])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
 }
 
 fn active_window() -> Option<gtk::Window> {

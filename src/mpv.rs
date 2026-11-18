@@ -14,6 +14,7 @@ pub(crate) struct Mpv {
     child: Child,
     socket: UnixStream,
     pub(crate) event_source: Option<glib::SourceId>,
+    pub(crate) write_source: Option<glib::SourceId>,
     socket_path: PathBuf,
     buffer: Vec<u8>,
     req: u64,
@@ -22,6 +23,11 @@ pub(crate) struct Mpv {
     pos: f64,
     sampled_at: Instant,
     pub(crate) duration: f64,
+    pub(crate) generation: u64,
+    pub(crate) volume: Option<f64>,
+    pub(crate) muted: Option<bool>,
+    volume_request: Option<u64>,
+    mute_request: Option<u64>,
     pub(crate) paused: bool,
     pub(crate) loaded: bool,
     pub(crate) paused_lyric_position: Option<f64>,
@@ -87,6 +93,7 @@ impl Mpv {
                     child,
                     socket,
                     event_source: None,
+                    write_source: None,
                     socket_path: path,
                     buffer: Vec::new(),
                     req: 0,
@@ -95,6 +102,11 @@ impl Mpv {
                     pos: 0.0,
                     sampled_at: Instant::now(),
                     duration: 0.0,
+                    generation: 0,
+                    volume: None,
+                    muted: None,
+                    volume_request: None,
+                    mute_request: None,
                     paused: true,
                     loaded: false,
                     paused_lyric_position: None,
@@ -102,7 +114,7 @@ impl Mpv {
                     failed: false,
                     error: None,
                 };
-                for property in ["time-pos", "duration", "pause"] {
+                for property in ["time-pos", "duration", "pause", "volume", "mute"] {
                     player.req += 1;
                     let _ = player.command(json!(["observe_property", player.req, property]));
                 }
@@ -142,6 +154,21 @@ impl Mpv {
         if is_load {
             self.awaiting_start.push_back(self.req);
         }
+        Ok(())
+    }
+
+    pub(crate) fn set_volume(&mut self, volume: f64) -> std::io::Result<()> {
+        self.command(json!(["set_property", "volume", volume]))?;
+        // Read back the actual property after all earlier writes on this socket.
+        self.command(json!(["get_property", "volume"]))?;
+        self.volume_request = Some(self.req);
+        Ok(())
+    }
+
+    pub(crate) fn set_muted(&mut self, muted: bool) -> std::io::Result<()> {
+        self.command(json!(["set_property", "mute", muted]))?;
+        self.command(json!(["get_property", "mute"]))?;
+        self.mute_request = Some(self.req);
         Ok(())
     }
 
@@ -206,7 +233,18 @@ impl Mpv {
     }
 
     fn handle_event(&mut self, value: &Value) {
+        let request = value["request_id"].as_u64();
+        if request.is_some() && request == self.volume_request {
+            self.volume_request = None;
+            self.volume = value["data"].as_f64();
+        }
+        if request.is_some() && request == self.mute_request {
+            self.mute_request = None;
+            self.muted = value["data"].as_bool();
+        }
         match value["name"].as_str().unwrap_or("") {
+            "volume" if self.volume_request.is_none() => self.volume = value["data"].as_f64(),
+            "mute" if self.mute_request.is_none() => self.muted = value["data"].as_bool(),
             "time-pos" => {
                 if let Some(position) = value["data"].as_f64() {
                     self.set_position(position);
@@ -261,6 +299,9 @@ impl Mpv {
 impl Drop for Mpv {
     fn drop(&mut self) {
         if let Some(source) = self.event_source.take() {
+            source.remove();
+        }
+        if let Some(source) = self.write_source.take() {
             source.remove();
         }
         let _ = self.command(json!(["quit"]));
