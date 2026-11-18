@@ -108,6 +108,12 @@ button.default:disabled, .tonal-button:disabled,
 
 .heading { font-size: 28px; font-weight: 400; }
 .secondary { color: @md_on_surface_variant; }
+.status-banner {
+    color: @md_on_secondary_container;
+    background-color: @md_secondary_container;
+    border-radius: 12px;
+    padding: 8px 12px;
+}
 .player-stage {
     background-color: @md_surface_low;
     border-radius: 28px;
@@ -224,10 +230,16 @@ entry {
 entry:focus { border-color: @md_primary; outline-offset: -1px; }
 entry placeholder, entry image { color: @md_on_surface_variant; }
 entry.search {
-    background-color: @md_surface_high;
+    background-color: @md_surface_container;
     border-color: transparent;
     border-radius: 999px;
+    min-height: 24px;
+    padding: 10px 16px;
 }
+entry.search:hover { background-color: @md_surface_high; }
+entry.search:focus { background-color: @md_surface_high; border-color: @md_primary; }
+entry.search image.left { margin-right: 8px; }
+entry.search image.right:hover { color: @md_primary; }
 
 .player-bar {
     background-color: @md_surface_container;
@@ -275,11 +287,12 @@ scrollbar, scrollbar trough { background: transparent; border: none; }
 scrollbar slider { min-width: 6px; min-height: 32px; background: @md_outline_variant; border: none; border-radius: 999px; }
 scrollbar slider:hover { background-color: @md_outline; }
 
-.queue-table {
+.queue-table, .queue-panel {
     background-color: @md_surface_low;
     border-radius: 20px;
     transition: background-color 180ms ease-out;
 }
+.queue-panel { padding: 16px; }
 .queue-columns {
     background-color: @md_surface_container;
     border-radius: 20px 20px 0 0;
@@ -289,6 +302,25 @@ scrollbar slider:hover { background-color: @md_outline; }
     font-weight: 500;
     transition: background-color 180ms ease-out, color 180ms ease-out;
 }
+
+.queue-pagination {
+    background-color: @md_surface_low;
+    border-radius: 999px;
+    padding: 2px 4px;
+}
+.page-arrow {
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+    border-color: transparent;
+    color: @md_primary;
+}
+.queue-pagination entry {
+    background-color: @md_surface_container;
+    border-radius: 12px;
+    padding: 4px 8px;
+}
+.queue-page-count { color: @md_on_surface_variant; }
 .queue-list, .queue-card, .queue-card viewport { background-color: transparent; }
 .queue-list { padding: 4px 8px; }
 .queue-row {
@@ -303,6 +335,7 @@ scrollbar slider:hover { background-color: @md_outline; }
 .queue-row.playing { background-color: @md_secondary_container; color: @md_on_secondary_container; }
 .queue-row.playing:hover { background-color: mix(@md_secondary_container, @md_on_secondary_container, 0.08); }
 .queue-row.playing:selected { box-shadow: inset 0 0 0 1px @md_outline; }
+.queue-row.playing:focus { outline-color: @md_on_secondary_container; }
 .queue-row:active, .queue-row:selected:active { background-color: mix(@md_surface_high, @md_on_surface, 0.12); }
 .queue-row.playing:active { background-color: mix(@md_secondary_container, @md_on_secondary_container, 0.12); }
 .queue-row:focus { -gtk-outline-radius: 12px; }

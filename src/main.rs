@@ -50,6 +50,7 @@ struct Model {
     tracks: Vec<Track>,
     current: Option<usize>,
     library_revision: u64,
+    queue_metadata_changed: std::collections::BTreeSet<usize>,
     cover_pending: std::collections::HashSet<PathBuf>,
     cover_attempted: std::collections::HashSet<PathBuf>,
     metadata_ready: std::collections::HashSet<PathBuf>,
@@ -98,6 +99,7 @@ fn build_ui(app: &gtk::Application) {
         tracks: Vec::new(),
         current: None,
         library_revision: 0,
+        queue_metadata_changed: Default::default(),
         cover_pending: std::collections::HashSet::new(),
         cover_attempted: Default::default(),
         metadata_ready: Default::default(),
@@ -190,14 +192,16 @@ fn build_ui(app: &gtk::Application) {
     let subheading = gtk::Label::new(None);
     subheading.set_xalign(0.0);
     subheading.set_line_wrap(true);
+    subheading.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
+    subheading.set_max_width_chars(72);
     subheading.set_no_show_all(true);
-    subheading.style_context().add_class("secondary");
+    subheading.style_context().add_class("status-banner");
     header.pack_start(&subheading, false, false, 0);
     subheading.set_margin_bottom(10);
     content.pack_start(&header, false, false, 0);
 
     let (player_page, _) = build_player_page(&model);
-    let queue_page = build_queue_page(&model);
+    let (queue_page, queue_search) = build_queue_page(&model);
     pages.add_named(&player_page, "Плеер");
     pages.add_named(&queue_page, "Очередь");
     pages.add_named(&build_settings_page(&model), "Настройки");
@@ -242,7 +246,19 @@ fn build_ui(app: &gtk::Application) {
     let settings_pages = pages.downgrade();
     let settings_buttons = Rc::downgrade(&page_buttons);
     window.connect_key_press_event(move |_, event| {
-        if event.keyval() == gtk::gdk::keys::constants::Escape {
+        let key = event.keyval();
+        let modifiers = event.state() & gtk::accelerator_get_default_mod_mask();
+        if key == gtk::gdk::keys::constants::f && modifiers == gtk::gdk::ModifierType::CONTROL_MASK
+        {
+            if let (Some(pages), Some(buttons)) =
+                (settings_pages.upgrade(), settings_buttons.upgrade())
+            {
+                set_page(&pages, &buttons, 1);
+                queue_search.grab_focus();
+                return glib::Propagation::Stop;
+            }
+        }
+        if key == gtk::gdk::keys::constants::Escape {
             if let (Some(pages), Some(buttons)) =
                 (settings_pages.upgrade(), settings_buttons.upgrade())
             {
@@ -259,6 +275,7 @@ fn build_ui(app: &gtk::Application) {
     let model_close = model.clone();
     window.connect_delete_event(move |_, _| {
         save_session(&model_close);
+        session::flush();
         glib::Propagation::Proceed
     });
 
@@ -293,7 +310,6 @@ fn build_ui(app: &gtk::Application) {
         if !alive.get() {
             return glib::ControlFlow::Break;
         }
-        tick_mpv(&model_tick);
         start_lyrics_job(&model_tick, false);
         glib::ControlFlow::Continue
     });
@@ -994,9 +1010,10 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
                     lyrics_adjustment.set_value(0.0);
                 }
                 if synchronized && !track.lyrics.is_empty() && lyrics_scroll.is_mapped() {
-                    let position = state.mpv.as_ref().map_or(0.0, |player| {
-                        player.paused_lyric_position.unwrap_or(player.pos)
-                    });
+                    let position = state
+                        .mpv
+                        .as_ref()
+                        .map_or(0.0, |player| player.position(state.speed));
                     snap_follow |= explicit_seek.replace(false)
                         || last_position.is_some_and(|last| (last - position).abs() > 0.75);
                     if last_position != Some(position) {
@@ -1139,15 +1156,23 @@ struct QueueRow {
     number: gtk::Label,
     cover: gtk::Image,
     cover_stack: gtk::Stack,
-    rendered_cover: Rc<RefCell<Option<PathBuf>>>,
+    rendered_cover: RefCell<Option<PathBuf>>,
     title: gtk::Label,
     artist: gtk::Label,
     duration: gtk::Label,
 }
 
-fn make_queue_row(position: usize, model: &Rc<RefCell<Model>>) -> QueueRow {
+const QUEUE_PAGE_SIZE: usize = 120;
+
+fn make_queue_row(
+    position: usize,
+    model: &Rc<RefCell<Model>>,
+    menu: &gtk::Menu,
+    menu_target: &Rc<RefCell<PathBuf>>,
+) -> QueueRow {
     let row = gtk::ListBoxRow::new();
     row.style_context().add_class("queue-row");
+    row.set_no_show_all(true);
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     line.set_margin_top(6);
     line.set_margin_bottom(6);
@@ -1183,23 +1208,28 @@ fn make_queue_row(position: usize, model: &Rc<RefCell<Model>>) -> QueueRow {
     line.pack_start(&titles, true, true, 0);
     line.pack_start(&duration, false, false, 0);
     let path = Rc::new(RefCell::new(PathBuf::new()));
-    let menu = gtk::Menu::new();
-    for (label, action) in [
-        ("Воспроизвести", QueueEdit::Play),
-        ("Поставить следующим", QueueEdit::PlayNext),
-        ("Переместить выше", QueueEdit::Up),
-        ("Переместить ниже", QueueEdit::Down),
-        ("Убрать из очереди", QueueEdit::Remove),
-    ] {
-        let item = gtk::MenuItem::with_label(label);
-        let model = model.clone();
-        let path = path.clone();
-        item.connect_activate(move |_| {
-            edit_queue(&model, &path.borrow(), action);
-        });
-        menu.append(&item);
-    }
-    line.pack_start(&menu_button(&menu, "Действия с треком"), false, false, 0);
+    let actions = icon_button("view-more-symbolic", "Действия с треком", "queue-menu");
+    actions.set_focus_on_click(true);
+    let menu = menu.downgrade();
+    let menu_target = menu_target.clone();
+    let menu_path = path.clone();
+    actions.connect_clicked(move |button| {
+        if let Some(menu) = menu.upgrade() {
+            menu_target.replace(menu_path.borrow().clone());
+            menu.set_attach_widget(Some(button));
+            if let Some(event) = gtk::current_event() {
+                menu.popup_at_widget(
+                    button,
+                    gtk::gdk::Gravity::SouthEast,
+                    gtk::gdk::Gravity::NorthEast,
+                    Some(&event),
+                );
+            } else {
+                menu.popup_easy(0, gtk::current_event_time());
+            }
+        }
+    });
+    line.pack_start(&actions, false, false, 0);
     row.add(&line);
 
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1242,44 +1272,89 @@ fn make_queue_row(position: usize, model: &Rc<RefCell<Model>>) -> QueueRow {
         context.drag_finish(moved, false, time);
     });
 
+    line.show_all();
     QueueRow {
         row,
         path,
         number,
         cover,
         cover_stack,
-        rendered_cover: Rc::new(RefCell::new(None)),
+        rendered_cover: RefCell::new(None),
         title,
         artist,
         duration,
     }
 }
 
-fn queue_filter(rows: &Rc<RefCell<Vec<QueueRow>>>, model: &Rc<RefCell<Model>>, filter: &str) {
-    let state = model.borrow();
-    for (index, item) in rows.borrow().iter().enumerate() {
-        let visible = state.tracks.get(index).is_some_and(|track| {
-            filter.is_empty()
-                || format!("{} {} {}", track.title, track.artist, track.album)
-                    .to_lowercase()
-                    .contains(filter)
-        });
-        item.row.set_visible(visible);
+impl QueueRow {
+    fn update(&mut self, track: &Track, index: usize, current: bool, next: bool) {
+        if *self.path.borrow() != track.path {
+            self.path.replace(track.path.clone());
+            if self.rendered_cover.borrow().as_ref() != track.cover_path.as_ref() {
+                self.clear_cover();
+            }
+        }
+        set_style_class(&self.row, "queued-next", next);
+        self.highlight(index, current);
+        let mut subtitle = if track.album.is_empty() {
+            track.artist.clone()
+        } else {
+            format!("{}  ·  {}", track.artist, track.album)
+        };
+        if next {
+            subtitle.push_str("  ·  Следующий");
+        }
+        let duration = if track.duration > 0.0 {
+            format_time(track.duration)
+        } else {
+            String::new()
+        };
+        if self.title.text() != track.title {
+            self.title.set_text(&track.title);
+            self.title.set_tooltip_text(Some(&track.title));
+        }
+        if self.artist.text() != subtitle {
+            self.artist.set_text(&subtitle);
+            self.artist.set_tooltip_text(Some(&subtitle));
+        }
+        if self.duration.text() != duration {
+            self.duration.set_text(&duration);
+        }
+        self.row.show();
+    }
+
+    fn highlight(&self, index: usize, current: bool) {
+        let number = if current {
+            "♪".into()
+        } else {
+            (index + 1).to_string()
+        };
+        if self.number.text() != number {
+            self.number.set_text(&number);
+        }
+        let tooltip = if current {
+            Some("Текущий трек")
+        } else {
+            self.row
+                .style_context()
+                .has_class("queued-next")
+                .then_some("Следующий трек")
+        };
+        if self.number.tooltip_text().as_deref() != tooltip {
+            self.number.set_tooltip_text(tooltip);
+        }
+        set_style_class(&self.row, "playing", current);
+    }
+
+    fn clear_cover(&self) {
+        self.rendered_cover.replace(None);
+        self.cover_stack.set_visible_child_name("placeholder");
+        self.cover.clear();
     }
 }
 
-fn update_queue_state(
-    body: &gtk::Stack,
-    rows: &Rc<RefCell<Vec<QueueRow>>>,
-    model: &Rc<RefCell<Model>>,
-) {
-    body.set_visible_child_name(if model.borrow().tracks.is_empty() {
-        "empty"
-    } else if rows.borrow().iter().any(|item| item.row.is_visible()) {
-        "list"
-    } else {
-        "no-results"
-    });
+fn queue_search_key(track: &Track) -> String {
+    format!("{} {} {}", track.title, track.artist, track.album).to_lowercase()
 }
 
 fn set_style_class(widget: &impl IsA<gtk::Widget>, class: &str, enabled: bool) {
@@ -1287,24 +1362,6 @@ fn set_style_class(widget: &impl IsA<gtk::Widget>, class: &str, enabled: bool) {
         widget.style_context().add_class(class);
     } else {
         widget.style_context().remove_class(class);
-    }
-}
-
-fn queue_highlight(rows: &Rc<RefCell<Vec<QueueRow>>>, current: Option<usize>) {
-    for (index, item) in rows.borrow().iter().enumerate() {
-        if Some(index) == current {
-            item.number.set_text("♪");
-            item.number.set_tooltip_text(Some("Текущий трек"));
-        } else {
-            item.number.set_text(&(index + 1).to_string());
-            item.number.set_tooltip_text(
-                item.row
-                    .style_context()
-                    .has_class("queued-next")
-                    .then_some("Следующий трек"),
-            );
-        }
-        set_style_class(&item.row, "playing", Some(index) == current);
     }
 }
 
@@ -1349,8 +1406,17 @@ fn edit_queue(model: &Rc<RefCell<Model>>, path: &Path, action: QueueEdit<'_>) ->
             if current.as_deref() == Some(path) {
                 return false;
             }
-            state.play_next = Some(path.to_path_buf());
-            state.library_revision += 1;
+            if state.play_next.as_deref() != Some(path) {
+                let previous = state.play_next.replace(path.to_path_buf());
+                if let Some(previous) = previous {
+                    if let Some(index) =
+                        state.tracks.iter().position(|track| track.path == previous)
+                    {
+                        state.queue_metadata_changed.insert(index);
+                    }
+                }
+                state.queue_metadata_changed.insert(index);
+            }
             drop(state);
             save_session(model);
             return true;
@@ -1413,7 +1479,26 @@ fn clear_queue(model: &Rc<RefCell<Model>>) {
     save_session(model);
 }
 
-fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
+fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntry) {
+    let row_menu = gtk::Menu::new();
+    let menu_target = Rc::new(RefCell::new(PathBuf::new()));
+    for (label, action) in [
+        ("Воспроизвести", QueueEdit::Play),
+        ("Поставить следующим", QueueEdit::PlayNext),
+        ("Переместить выше", QueueEdit::Up),
+        ("Переместить ниже", QueueEdit::Down),
+        ("Убрать из очереди", QueueEdit::Remove),
+    ] {
+        let item = gtk::MenuItem::with_label(label);
+        let model = model.clone();
+        let path = menu_target.clone();
+        item.connect_activate(move |_| {
+            edit_queue(&model, &path.borrow(), action);
+        });
+        row_menu.append(&item);
+    }
+    row_menu.show_all();
+
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let summary = gtk::Label::new(None);
     summary.set_xalign(0.0);
@@ -1428,6 +1513,8 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
     toolbar.style_context().add_class("queue-toolbar");
     let search = gtk::SearchEntry::new();
     search.set_placeholder_text(Some("Найти в очереди"));
+    describe_control(&search, "Поиск по названию, исполнителю и альбому");
+    search.connect_stop_search(|entry| entry.set_text(""));
     search.style_context().add_class("search");
     toolbar.pack_start(&search, true, true, 0);
     let menu = gtk::Menu::new();
@@ -1486,13 +1573,22 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
     let empty_note = gtk::Label::new(Some("Добавь файлы или папку с музыкой"));
     empty_note.style_context().add_class("secondary");
     empty_box.pack_start(&empty_note, false, false, 0);
-    body.add_named(&empty_box, "empty");
+    let empty_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    empty_panel.style_context().add_class("queue-panel");
+    empty_panel.pack_start(&empty_box, true, true, 0);
+    body.add_named(&empty_panel, "empty");
     let no_results = gtk::Box::new(gtk::Orientation::Vertical, 12);
     no_results.set_halign(gtk::Align::Center);
     no_results.set_valign(gtk::Align::Center);
+    let no_icon = symbolize("system-search-symbolic", 32);
+    no_icon.style_context().add_class("empty-glyph");
+    no_results.pack_start(&no_icon, false, false, 0);
     let no_title = gtk::Label::new(Some("Ничего не нашлось"));
     no_title.style_context().add_class("empty-title");
-    let no_note = gtk::Label::new(Some("Попробуй другое название или имя исполнителя"));
+    let no_note = gtk::Label::new(Some("Попробуй другое название, исполнителя или альбом"));
+    no_note.set_justify(gtk::Justification::Center);
+    no_note.set_line_wrap(true);
+    no_note.set_max_width_chars(36);
     no_note.style_context().add_class("secondary");
     let clear = gtk::Button::with_label("Сбросить поиск");
     clear.set_halign(gtk::Align::Center);
@@ -1501,7 +1597,10 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
     no_results.pack_start(&no_title, false, false, 0);
     no_results.pack_start(&no_note, false, false, 0);
     no_results.pack_start(&clear, false, false, 8);
-    body.add_named(&no_results, "no-results");
+    let results_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    results_panel.style_context().add_class("queue-panel");
+    results_panel.pack_start(&no_results, true, true, 0);
+    body.add_named(&results_panel, "no-results");
 
     let scroll = gtk::ScrolledWindow::new(gtk::Adjustment::NONE, gtk::Adjustment::NONE);
     scroll.style_context().add_class("queue-card");
@@ -1534,6 +1633,61 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
     body.set_visible_child_name("empty");
     page.pack_start(&body, true, true, 0);
 
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    footer.style_context().add_class("queue-pagination");
+    footer.set_halign(gtk::Align::End);
+    let previous = icon_button("go-previous-symbolic", "Предыдущая страница", "page-arrow");
+    let next = icon_button("go-next-symbolic", "Следующая страница", "page-arrow");
+    let page_number = gtk::Entry::new();
+    page_number.set_width_chars(4);
+    page_number.set_max_width_chars(5);
+    page_number.set_alignment(0.5);
+    page_number.set_input_purpose(gtk::InputPurpose::Digits);
+    page_number.set_text("1");
+    describe_control(&page_number, "Страница очереди");
+    let page_count = gtk::Label::new(None);
+    page_count.style_context().add_class("queue-page-count");
+    footer.pack_start(&previous, false, false, 0);
+    footer.pack_start(&page_number, false, false, 0);
+    footer.pack_start(&page_count, false, false, 4);
+    footer.pack_start(&next, false, false, 0);
+    let requested_page = Rc::new(Cell::new(1_usize));
+    let last_page = Rc::new(Cell::new(1_usize));
+    previous.connect_clicked({
+        let requested = requested_page.clone();
+        move |_| requested.set(requested.get().saturating_sub(1).max(1))
+    });
+    next.connect_clicked({
+        let requested = requested_page.clone();
+        let last_page = last_page.clone();
+        move |_| requested.set((requested.get() + 1).min(last_page.get()))
+    });
+    page_number.connect_activate({
+        let requested = requested_page.clone();
+        let last_page = last_page.clone();
+        move |entry| {
+            if let Ok(value) = entry.text().trim().parse::<usize>() {
+                requested.set(value.clamp(1, last_page.get()));
+            }
+            entry.set_text(&requested.get().to_string());
+        }
+    });
+    footer.show_all();
+    footer.set_no_show_all(true);
+    footer.hide();
+    page.pack_start(&footer, false, false, 0);
+
+    let jump = gtk::MenuItem::with_label("Показать текущий трек");
+    menu.prepend(&jump);
+    jump.show();
+    let jump_requested = Rc::new(Cell::new(false));
+    let request = jump_requested.clone();
+    let jump_search = search.clone();
+    jump.connect_activate(move |_| {
+        jump_search.set_text("");
+        request.set(true);
+    });
+
     let rows: Rc<RefCell<Vec<QueueRow>>> = Rc::new(RefCell::new(Vec::new()));
 
     let model_play = model.clone();
@@ -1555,38 +1709,187 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
         }
     });
 
-    let model_filter = model.clone();
-    let rows_filter = rows.clone();
-    let body_filter = body.clone();
+    let query = Rc::new(RefCell::new(String::new()));
+    let search_query = query.clone();
     search.connect_search_changed(move |entry| {
-        let filter = entry.text().trim().to_lowercase();
-        queue_filter(&rows_filter, &model_filter, &filter);
-        update_queue_state(&body_filter, &rows_filter, &model_filter);
+        search_query.replace(entry.text().trim().to_lowercase());
     });
 
     let model_update = model.clone();
     let rows_update = rows.clone();
-    let list_update = list.clone();
-    let body_update = body.clone();
-    let search_update = search.clone();
+    let page_update = page.downgrade();
     let alive = widget_lifetime(&page);
     let mut rendered_revision = u64::MAX;
+    let mut rendered_query = String::new();
+    let mut search_keys = Vec::new();
+    let mut matches = Vec::new();
+    let mut page_indices = Vec::new();
+    let mut render_index = 0;
     let mut rendered_current = None;
+    let mut selected_page = usize::MAX;
+    let mut jump_to = None;
     let mut visible_covers = Vec::new();
-    glib::timeout_add_local(Duration::from_millis(80), move || {
+    let mut update = move || {
         if !alive.get() {
-            return glib::ControlFlow::Break;
+            return None;
         }
-        let revision = {
-            let state = model_update.borrow();
-            start.set_sensitive(!state.tracks.is_empty() && state.mpv.is_some());
-            clear_all.set_sensitive(!state.tracks.is_empty());
-            state.library_revision
+        if !page_update.upgrade().is_some_and(|page| page.is_mapped()) {
+            return Some(Duration::from_millis(64));
+        }
+        let mut state = model_update.borrow_mut();
+        let track_count = state.tracks.len();
+        let order_changed = rendered_revision != state.library_revision;
+        rendered_revision = state.library_revision;
+        let changed = std::mem::take(&mut state.queue_metadata_changed);
+        let query = query.borrow();
+        let query_changed = rendered_query != *query;
+        if order_changed {
+            search_keys.clear();
+        }
+        for index in changed.iter().copied() {
+            if let Some((key, track)) = search_keys.get_mut(index).zip(state.tracks.get(index)) {
+                *key = queue_search_key(track);
+            }
+        }
+        if order_changed || query_changed || (!query.is_empty() && !changed.is_empty()) {
+            matches.clear();
+            if query.is_empty() {
+                matches.extend(0..track_count);
+            } else {
+                if search_keys.is_empty() {
+                    search_keys.extend(state.tracks.iter().map(queue_search_key));
+                }
+                matches.extend(
+                    search_keys
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, key)| key.contains(query.as_str()).then_some(index)),
+                );
+            }
+            rendered_query.clone_from(&query);
+        }
+
+        let pages = matches.len().div_ceil(QUEUE_PAGE_SIZE).max(1);
+        if last_page.replace(pages) != pages {
+            page_count.set_text(&format!("/ {pages}"));
+        }
+        if query_changed {
+            requested_page.set(1);
+        }
+        if jump_requested.get() && query.is_empty() {
+            jump_requested.set(false);
+            jump_to = state.current;
+            if let Some(index) = state.current {
+                requested_page.set(index / QUEUE_PAGE_SIZE + 1);
+            }
+        }
+        let current_page = requested_page.get().min(pages);
+        requested_page.set(current_page);
+        let page_index = current_page - 1;
+        if footer.is_visible() != (pages > 1) {
+            footer.set_visible(pages > 1);
+        }
+        previous.set_sensitive(page_index > 0);
+        next.set_sensitive(page_index + 1 < pages);
+        jump.set_sensitive(state.current.is_some());
+        let start_index = page_index * QUEUE_PAGE_SIZE;
+        let indices = &matches[start_index..(start_index + QUEUE_PAGE_SIZE).min(matches.len())];
+        let new_page = selected_page != page_index || query_changed;
+        if new_page {
+            selected_page = page_index;
+            page_number.set_text(&current_page.to_string());
+            if !query.is_empty() {
+                jump_to = None;
+            }
+            row_menu.popdown();
+            list.unselect_all();
+            scroll.vadjustment().set_value(0.0);
+        }
+        if order_changed || page_indices != indices || new_page {
+            page_indices.clear();
+            page_indices.extend_from_slice(indices);
+            render_index = 0;
+        }
+        let mut rows = rows_update.borrow_mut();
+        while rows.len() > page_indices.len() {
+            if let Some(item) = rows.pop() {
+                list.remove(&item.row);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(6);
+        while render_index < page_indices.len() && Instant::now() < deadline {
+            let index = page_indices[render_index];
+            if render_index == rows.len() {
+                let item = make_queue_row(index, &model_update, &row_menu, &menu_target);
+                list.add(&item.row);
+                rows.push(item);
+            }
+            let track = &state.tracks[index];
+            rows[render_index].update(
+                track,
+                index,
+                state.current == Some(index),
+                state.play_next.as_ref() == Some(&track.path),
+            );
+            render_index += 1;
+        }
+        for index in changed.iter().copied() {
+            if let Ok(slot) = page_indices.binary_search(&index) {
+                if slot < render_index {
+                    let track = &state.tracks[index];
+                    rows[slot].update(
+                        track,
+                        index,
+                        state.current == Some(index),
+                        state.play_next.as_ref() == Some(&track.path),
+                    );
+                }
+            }
+        }
+        if state.current != rendered_current {
+            for index in [rendered_current, state.current].into_iter().flatten() {
+                if let Ok(slot) = page_indices.binary_search(&index) {
+                    if slot < render_index {
+                        rows[slot].highlight(index, state.current == Some(index));
+                    }
+                }
+            }
+            rendered_current = state.current;
+        }
+        let complete = render_index == page_indices.len();
+        if let Some(index) = jump_to {
+            if let Ok(slot) = page_indices.binary_search(&index) {
+                if let Some(item) = rows
+                    .get(slot)
+                    .filter(|item| item.row.allocated_height() > 1 && slot < render_index)
+                {
+                    let bounds = item.row.allocation();
+                    let adjustment = scroll.vadjustment();
+                    adjustment.set_value(f64::from(bounds.y()) - adjustment.page_size() / 2.0);
+                    list.select_row(Some(&item.row));
+                    item.row.grab_focus();
+                    jump_to = None;
+                }
+            } else {
+                jump_to = None;
+            }
+        }
+        drop(rows);
+        let visible = if track_count == 0 {
+            "empty"
+        } else if matches.is_empty() {
+            "no-results"
+        } else {
+            "list"
         };
-        if rendered_revision != revision {
-            rendered_revision = revision;
-            let state = model_update.borrow();
-            let total: f64 = state.tracks.iter().map(|track| track.duration).sum();
+        if body.visible_child_name().as_deref() != Some(visible) {
+            body.set_visible_child_name(visible);
+        }
+        if order_changed || query_changed || !changed.is_empty() {
+            let total: f64 = matches
+                .iter()
+                .map(|&index| state.tracks[index].duration)
+                .sum();
             let hours = (total / 3600.0) as u64;
             let minutes = (total / 60.0) as u64 % 60;
             let duration = if hours > 0 {
@@ -1596,70 +1899,23 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
             } else {
                 String::new()
             };
-            summary.set_text(&format!(
-                "{}{}",
-                tracks_phrase(state.tracks.len()),
-                duration
-            ));
-
-            {
-                let mut rows = rows_update.borrow_mut();
-                while rows.len() < state.tracks.len() {
-                    let item = make_queue_row(rows.len(), &model_update);
-                    list_update.add(&item.row);
-                    rows.push(item);
-                }
-                while rows.len() > state.tracks.len() {
-                    if let Some(item) = rows.pop() {
-                        list_update.remove(&item.row);
-                    }
-                }
-                for (index, track) in state.tracks.iter().enumerate() {
-                    let item = &rows[index];
-                    if *item.path.borrow() != track.path {
-                        item.path.replace(track.path.clone());
-                        if item.rendered_cover.borrow().as_ref() != track.cover_path.as_ref() {
-                            item.rendered_cover.replace(None);
-                            item.cover_stack.set_visible_child_name("placeholder");
-                            item.cover.clear();
-                        }
-                    }
-                    let is_next = state.play_next.as_ref() == Some(&track.path);
-                    set_style_class(&item.row, "queued-next", is_next);
-                    item.number.set_text(&(index + 1).to_string());
-                    item.number
-                        .set_tooltip_text(is_next.then_some("Следующий трек"));
-
-                    item.title.set_text(&track.title);
-                    item.title.set_tooltip_text(Some(&track.title));
-                    let mut subtitle = if track.album.is_empty() {
-                        track.artist.clone()
-                    } else {
-                        format!("{}  ·  {}", track.artist, track.album)
-                    };
-                    if is_next {
-                        subtitle.push_str("  ·  Следующий");
-                    }
-                    item.artist.set_text(&subtitle);
-                    item.artist.set_tooltip_text(Some(&subtitle));
-                    item.duration.set_text(&if track.duration > 0.0 {
-                        format_time(track.duration)
-                    } else {
-                        String::new()
-                    });
-                }
+            let text = if query.is_empty() {
+                format!("{}{duration}", tracks_phrase(track_count))
+            } else {
+                format!("{} из {track_count}{duration}", matches.len())
+            };
+            if summary.text() != text {
+                summary.set_text(&text);
             }
-            list_update.show_all();
-            let filter = search_update.text().trim().to_lowercase();
-            queue_filter(&rows_update, &model_update, &filter);
-            update_queue_state(&body_update, &rows_update, &model_update);
-            queue_highlight(&rows_update, state.current);
         }
-        let current = model_update.borrow().current;
-        if current != rendered_current {
-            rendered_current = current;
-            queue_highlight(&rows_update, current);
+        let can_start = track_count > 0 && state.mpv.is_some();
+        if start.is_sensitive() != can_start {
+            start.set_sensitive(can_start);
         }
+        if clear_all.is_sensitive() != (track_count > 0) {
+            clear_all.set_sensitive(track_count > 0);
+        }
+        drop(state);
         // Load only visible rows (+ a small buffer), with bounded background work.
         if scroll.is_mapped() {
             let state = model_update.borrow();
@@ -1668,15 +1924,19 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
             let bottom = top + adjustment.page_size();
             let available = 4usize.saturating_sub(state.cover_pending.len());
             let mut jobs = Vec::new();
-            let first = list_update
+            let first = list
                 .row_at_y((top - 160.0).max(4.0) as i32)
                 .map_or(0, |row| row.index() as usize);
             let rows = rows_update.borrow();
             let mut visible = Vec::new();
-            for (index, (item, track)) in rows.iter().zip(&state.tracks).enumerate().skip(first) {
-                if !item.row.is_visible() {
-                    continue;
-                }
+            for (index, (item, &track_index)) in rows
+                .iter()
+                .zip(&page_indices)
+                .enumerate()
+                .take(render_index)
+                .skip(first)
+            {
+                let track = &state.tracks[track_index];
                 let bounds = item.row.allocation();
                 let y = f64::from(bounds.y());
                 let end = y + f64::from(bounds.height());
@@ -1714,9 +1974,7 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
                         .get(index)
                         .filter(|_| visible.binary_search(&index).is_err())
                     {
-                        item.rendered_cover.replace(None);
-                        item.cover_stack.set_visible_child_name("placeholder");
-                        item.cover.clear();
+                        item.clear_cover();
                     }
                 }
                 visible_covers = visible;
@@ -1733,9 +1991,14 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> gtk::Widget {
                 start_cover_job(&model_update, path);
             }
         }
-        glib::ControlFlow::Continue
+        Some(Duration::from_millis(if complete { 64 } else { 16 }))
+    };
+    glib::MainContext::default().spawn_local(async move {
+        while let Some(delay) = update() {
+            glib::timeout_future(delay).await;
+        }
     });
-    page.upcast()
+    (page.upcast(), search)
 }
 
 fn build_controls(model: &Rc<RefCell<Model>>) -> gtk::Widget {
@@ -1955,6 +2218,7 @@ fn build_controls(model: &Rc<RefCell<Model>>) -> gtk::Widget {
                 if player.paused {
                     player.paused_lyric_position = Some(at);
                 }
+                player.set_position(at);
                 time_clone.set_text(&format_time(at));
             }
         }
@@ -1975,6 +2239,7 @@ fn build_controls(model: &Rc<RefCell<Model>>) -> gtk::Widget {
     let mut rendered_time = None;
     let mut rendered_duration = None;
     let mut rendered_playing: Option<bool> = None;
+    let animation = Rc::new(Cell::new(false));
     glib::timeout_add_local(Duration::from_millis(120), move || {
         if !alive.get() {
             return glib::ControlFlow::Break;
@@ -2042,38 +2307,63 @@ fn build_controls(model: &Rc<RefCell<Model>>) -> gtk::Widget {
                 widget.set_sensitive(sensitive);
             }
         }
-        if let Some(player) = state.mpv.as_ref() {
-            let position = player.paused_lyric_position.unwrap_or(player.pos);
-            let second = position as u64;
-            if rendered_time != Some(second) {
-                rendered_time = Some(second);
-                time_tick.set_text(&format_time(position));
+        let player = state.mpv.as_ref();
+        let position = player.map_or(0.0, |player| player.position(state.speed));
+        let second = position as u64;
+        if rendered_time != Some(second) {
+            rendered_time = Some(second);
+            time_tick.set_text(&format_time(position));
+        }
+        let duration = player.map_or(0.0, |p| p.duration);
+        if rendered_duration != Some(duration as u64) {
+            rendered_duration = Some(duration as u64);
+            duration_tick.set_text(&format_time(duration));
+        }
+        let playing = player.is_some_and(|p| p.loaded && !p.paused);
+        if rendered_playing != Some(playing) {
+            rendered_playing = Some(playing);
+            set_play_icon(&play_tick, playing);
+        }
+        if playing && duration > 0.0 && seek_tick.is_mapped() && animations_enabled() {
+            if !animation.replace(true) {
+                let active = animation.clone();
+                let model = m.clone();
+                seek_tick.add_tick_callback(move |scale, _| {
+                    let state = model.borrow();
+                    if let Some(player) = state.mpv.as_ref().filter(|player| {
+                        player.loaded
+                            && !player.paused
+                            && player.duration > 0.0
+                            && scale.is_mapped()
+                            && animations_enabled()
+                    }) {
+                        update_seek_display(scale, player.position(state.speed), player.duration);
+                        return glib::ControlFlow::Continue;
+                    }
+                    active.set(false);
+                    glib::ControlFlow::Break
+                });
             }
-            let duration = player.duration as u64;
-            if rendered_duration != Some(duration) {
-                rendered_duration = Some(duration);
-                duration_tick.set_text(&format_time(player.duration));
-            }
-            if !seek_tick.has_grab() {
-                let fraction = if player.duration > 0.0 {
-                    position / player.duration
-                } else {
-                    0.0
-                };
-                let value = (fraction * 1000.0).clamp(0.0, 1000.0);
-                if seek_tick.value() != value {
-                    seek_tick.set_value(value);
-                }
-            }
-            let playing = player.loaded && !player.paused;
-            if rendered_playing != Some(playing) {
-                rendered_playing = Some(playing);
-                set_play_icon(&play_tick, playing);
-            }
+        } else {
+            update_seek_display(&seek_tick, position, duration);
         }
         glib::ControlFlow::Continue
     });
     panel.upcast()
+}
+
+fn update_seek_display(scale: &gtk::Scale, position: f64, duration: f64) {
+    if scale.has_grab() {
+        return;
+    }
+    let value = if duration > 0.0 {
+        (position / duration * 1000.0).clamp(0.0, 1000.0)
+    } else {
+        0.0
+    };
+    if (scale.value() - value).abs() >= 0.05 || (value == 0.0 && scale.value() != 0.0) {
+        scale.set_value(value);
+    }
 }
 
 fn set_play_icon(button: &gtk::Button, playing: bool) {
@@ -2155,7 +2445,32 @@ fn start_mpv(model: &Rc<RefCell<Model>>) {
                     "loop-file",
                     if state.repeat == 2 { "inf" } else { "no" }
                 ]));
+                let events_model = Rc::downgrade(&model);
+                player.event_source = Some(glib::unix_fd_add_local(
+                    player.socket_fd(),
+                    glib::IOCondition::IN | glib::IOCondition::HUP | glib::IOCondition::ERR,
+                    move |_, _| {
+                        if let Some(model) = events_model.upgrade() {
+                            tick_mpv(&model);
+                        }
+                        glib::ControlFlow::Continue
+                    },
+                ));
                 state.mpv = Some(player);
+                let model = Rc::downgrade(&model);
+                // Retry queued writes if mpv has not made room for them yet.
+                glib::timeout_add_local(Duration::from_millis(160), move || {
+                    let Some(model) = model.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let pending = model.borrow().mpv.as_ref().map(Mpv::has_outgoing);
+                    match pending {
+                        Some(true) => tick_mpv(&model),
+                        Some(false) => {}
+                        None => return glib::ControlFlow::Break,
+                    }
+                    glib::ControlFlow::Continue
+                });
             }
             Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 model.borrow_mut().status =
@@ -2173,7 +2488,13 @@ fn tick_mpv(model: &Rc<RefCell<Model>>) {
         let Some(player) = state.mpv.as_mut() else {
             return;
         };
-        player.read_events();
+        if let Err(error) = player.read_events() {
+            state.mpv = None;
+            state.status = Some(format!(
+                "Связь с mpv прервалась: {error}. Перезапусти плеер."
+            ));
+            return;
+        }
         let ended = std::mem::take(&mut player.ended);
         let failed = std::mem::take(&mut player.failed);
         if let Some(error) = player.error.take() {
@@ -2221,10 +2542,17 @@ fn load_index(model: &Rc<RefCell<Model>>, index: usize) {
         return;
     }
     let path = state.tracks[index].path.clone();
+    let Some(mpv_path) = path.to_str() else {
+        state.status = Some("Имя файла содержит символы, которые mpv IPC не принимает.".into());
+        return;
+    };
     state.status = None;
     if let Some(player) = state.mpv.as_mut() {
-        if player.command(json!(["loadfile", path, "replace"])).is_ok() {
-            player.pos = 0.0;
+        if player
+            .command(json!(["loadfile", mpv_path, "replace"]))
+            .is_ok()
+        {
+            player.set_position(0.0);
             player.duration = 0.0;
             player.ended = false;
             player.paused = false;
@@ -2241,7 +2569,7 @@ fn load_index(model: &Rc<RefCell<Model>>, index: usize) {
     }
     if state.play_next.as_ref() == Some(&path) {
         state.play_next = None;
-        state.library_revision += 1;
+        state.queue_metadata_changed.insert(index);
     }
     drop(state);
     save_session(model);
@@ -2272,9 +2600,7 @@ fn can_advance(state: &Model) -> bool {
     state.play_next.is_some()
         || state.repeat == 1
         || if state.shuffle {
-            state
-                .shuffle_order
-                .can_advance(state.tracks.iter().map(|track| track.path.as_path()))
+            state.shuffle_order.can_advance(state.tracks.len())
         } else {
             current + 1 < state.tracks.len()
         }
@@ -2356,7 +2682,7 @@ fn stop_playback(model: &Rc<RefCell<Model>>) {
         let _ = player.command(json!(["stop"]));
         player.paused = true;
         player.loaded = false;
-        player.pos = 0.0;
+        player.set_position(0.0);
         player.duration = 0.0;
     }
 }
@@ -2375,15 +2701,20 @@ fn append_paths(model: &Rc<RefCell<Model>>, paths: Vec<PathBuf>) {
         }
         found.sort();
         found.dedup();
-        let _ = sender.send(found);
+        let total = found.len();
+        // Session and mpv IPC use UTF-8 paths. Keep unsupported names out of saved queues.
+        found.retain(|path| path.to_str().is_some());
+        let unsupported = total - found.len();
+        let _ = sender.send((found, unsupported));
     });
     let model_result = model.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         match receiver.try_recv() {
-            Ok(paths) => {
+            Ok((paths, unsupported)) => {
                 let mut state = model_result.borrow_mut();
                 state.imports_pending = state.imports_pending.saturating_sub(1);
                 let found = !paths.is_empty();
+                let skipped = || format!("Пропущено файлов с именами вне UTF-8: {unsupported}.");
                 let mut fresh = Vec::new();
                 let mut known: std::collections::HashSet<PathBuf> = state
                     .tracks
@@ -2397,7 +2728,9 @@ fn append_paths(model: &Rc<RefCell<Model>>, paths: Vec<PathBuf>) {
                     }
                 }
                 if fresh.is_empty() {
-                    state.status = Some(if found {
+                    state.status = Some(if unsupported > 0 {
+                        skipped()
+                    } else if found {
                         "Эти треки уже есть в очереди".into()
                     } else {
                         "Поддерживаемые аудиофайлы не найдены. Проверь папку и форматы файлов."
@@ -2412,6 +2745,9 @@ fn append_paths(model: &Rc<RefCell<Model>>, paths: Vec<PathBuf>) {
                 save_session(&model_result);
                 if start {
                     play_index(&model_result, 0);
+                }
+                if unsupported > 0 {
+                    model_result.borrow_mut().status = Some(skipped());
                 }
                 start_metadata_job(&model_result, fresh);
                 glib::ControlFlow::Break
@@ -2509,22 +2845,9 @@ fn start_metadata_job(model: &Rc<RefCell<Model>>, mut paths: Vec<PathBuf>) {
         let mut received = 0;
         while received < 32 {
             match receiver.try_recv() {
-                Ok(mut track) => {
-                    let ready_path = track.path.clone();
+                Ok(track) => {
                     let mut state = model_result.borrow_mut();
-                    if let Some(existing) = indices
-                        .get(&track.path)
-                        .and_then(|index| state.tracks.get_mut(*index))
-                    {
-                        track.cover_path = existing.cover_path.clone();
-                        if track.lyrics.is_empty() {
-                            track.lyrics = existing.lyrics.clone();
-                        }
-                        *existing = track;
-                        state.metadata_pending.remove(&ready_path);
-                        state.metadata_ready.insert(ready_path);
-                        state.library_revision += 1;
-                    }
+                    merge_metadata(&mut state, &indices, track);
                     received += 1;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
@@ -2535,6 +2858,39 @@ fn start_metadata_job(model: &Rc<RefCell<Model>>, mut paths: Vec<PathBuf>) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+fn merge_metadata(
+    state: &mut Model,
+    indices: &std::collections::HashMap<PathBuf, usize>,
+    mut track: Track,
+) {
+    state.metadata_pending.remove(&track.path);
+    let index = indices
+        .get(&track.path)
+        .copied()
+        .filter(|&index| {
+            state
+                .tracks
+                .get(index)
+                .is_some_and(|existing| existing.path == track.path)
+        })
+        .or_else(|| {
+            state
+                .tracks
+                .iter()
+                .position(|existing| existing.path == track.path)
+        });
+    if let Some(index) = index {
+        let existing = &mut state.tracks[index];
+        track.cover_path = existing.cover_path.take();
+        if track.lyrics.is_empty() {
+            track.lyrics = std::mem::take(&mut existing.lyrics);
+        }
+        state.metadata_ready.insert(track.path.clone());
+        *existing = track;
+        state.queue_metadata_changed.insert(index);
+    }
 }
 
 /// At most two requests at once; results belong to the file, never to the open view.
@@ -2692,7 +3048,7 @@ fn save_session(model: &Rc<RefCell<Model>>) {
         speed: state.speed,
         soundcloud_dir: Some(state.soundcloud_dir.clone()),
     };
-    if let Err(error) = session::save(&saved) {
+    if let Err(error) = session::save(saved) {
         eprintln!("Не удалось сохранить очередь: {error}");
     }
 }
@@ -3012,7 +3368,8 @@ fn show_soundcloud_dialog(model: &Rc<RefCell<Model>>) {
     let auth_title = gtk::Label::new(Some("Доступ"));
     auth_title.set_xalign(0.0);
     auth_title.style_context().add_class("settings-label");
-    let auth_status = gtk::Label::new(Some(soundcloud::token_summary()));
+    let auth_status = gtk::Label::new(None);
+    refresh_token_summary(&auth_status);
     auth_status.set_xalign(1.0);
     auth_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
     auth_status.style_context().add_class("settings-note");
@@ -3086,7 +3443,7 @@ fn show_soundcloud_dialog(model: &Rc<RefCell<Model>>) {
     let auth_window = dialog.clone();
     auth_button.connect_clicked(move |_| {
         show_soundcloud_token_dialog(&auth_window);
-        auth_status_refresh.set_text(soundcloud::token_summary());
+        refresh_token_summary(&auth_status_refresh);
     });
 
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -3120,7 +3477,6 @@ fn show_soundcloud_dialog(model: &Rc<RefCell<Model>>) {
             return;
         }
         let dir = model_start.borrow().soundcloud_dir.clone();
-        let token = soundcloud::get_token();
         batch_start.set(false);
         collected_start.borrow_mut().clear();
         busy_start.set(true);
@@ -3136,7 +3492,7 @@ fn show_soundcloud_dialog(model: &Rc<RefCell<Model>>) {
         progress_start.set_text(Some("Определяем трек…"));
         status_start.style_context().remove_class("error");
         status_start.set_text("Соединяемся с SoundCloud…");
-        let new_job = soundcloud::start(link, dir, token, sender_download.clone());
+        let new_job = soundcloud::start(link, dir, sender_download.clone());
         *job_start.borrow_mut() = Some(new_job);
     });
 
@@ -3177,14 +3533,6 @@ fn show_soundcloud_dialog(model: &Rc<RefCell<Model>>) {
             return;
         }
         let dir = model_library.borrow().soundcloud_dir.clone();
-        let token = soundcloud::get_token();
-        if token.is_none() {
-            status_library.style_context().add_class("error");
-            status_library.set_text(
-                "Для библиотеки нужен токен SoundCloud. Нажми «Авторизация…» и вставь токен своей сессии.",
-            );
-            return;
-        }
         batch_library.set(true);
         collected_library.borrow_mut().clear();
         busy_library.set(true);
@@ -3201,7 +3549,7 @@ fn show_soundcloud_dialog(model: &Rc<RefCell<Model>>) {
         progress_library.set_text(Some("Читаем библиотеку…"));
         status_library.style_context().remove_class("error");
         status_library.set_text("Ищем треки в лайках, плейлистах и загрузках…");
-        let new_job = soundcloud::start_library(dir, token, sender_library.clone());
+        let new_job = soundcloud::start_library(dir, sender_library.clone());
         *job_library.borrow_mut() = Some(new_job);
     });
 
@@ -3439,6 +3787,17 @@ fn show_soundcloud_dialog(model: &Rc<RefCell<Model>>) {
     dialog.close();
 }
 
+fn refresh_token_summary(label: &gtk::Label) {
+    label.set_text("Проверяем доступ…");
+    let label = label.downgrade();
+    glib::MainContext::default().spawn_local(async move {
+        let result = gtk::gio::spawn_blocking(soundcloud::token_summary).await;
+        if let Some(label) = label.upgrade() {
+            label.set_text(result.unwrap_or("Связка ключей недоступна"));
+        }
+    });
+}
+
 fn show_soundcloud_token_dialog(parent: &gtk::Dialog) {
     let dialog = gtk::Dialog::with_buttons(
         Some("Доступ к SoundCloud"),
@@ -3476,7 +3835,7 @@ fn show_soundcloud_token_dialog(parent: &gtk::Dialog) {
     entry.set_placeholder_text(Some("Вставь значение токена"));
     content.pack_start(&entry, false, false, 0);
 
-    let status = gtk::Label::new(Some(soundcloud::token_summary()));
+    let status = gtk::Label::new(None);
     status.set_xalign(0.0);
     status.set_line_wrap(true);
     status.set_max_width_chars(50);
@@ -3492,8 +3851,82 @@ fn show_soundcloud_token_dialog(parent: &gtk::Dialog) {
     buttons.pack_end(&save, false, false, 0);
     content.pack_start(&buttons, false, false, 4);
 
+    let busy = Rc::new(Cell::new(false));
+    let status_initial = status.downgrade();
+    let busy_initial = busy.clone();
+    status.set_text("Проверяем связку ключей…");
+    glib::MainContext::default().spawn_local(async move {
+        let result = gtk::gio::spawn_blocking(soundcloud::token_summary).await;
+        if let Some(status) = status_initial.upgrade().filter(|_| !busy_initial.get()) {
+            if let Ok(summary) = result {
+                if status.text() == "Проверяем связку ключей…" {
+                    status.set_text(summary);
+                }
+            }
+        }
+    });
+
+    let update_access = {
+        let busy = busy.clone();
+        let entry = entry.downgrade();
+        let status = status.downgrade();
+        let buttons = buttons.downgrade();
+        move |token: Option<String>| {
+            if busy.replace(true) {
+                return;
+            }
+            if let Some(entry) = entry.upgrade() {
+                entry.set_text("");
+                entry.set_sensitive(false);
+            }
+            if let Some(buttons) = buttons.upgrade() {
+                buttons.set_sensitive(false);
+            }
+            if let Some(status) = status.upgrade() {
+                status.set_text("Обращаемся к связке ключей…");
+            }
+            let task = gtk::gio::spawn_blocking(move || match token {
+                Some(token) => {
+                    let message = match soundcloud::save_token(&token) {
+                        Ok(()) => "Токен сохранён в связке ключей.".into(),
+                        Err(error) => {
+                            format!("{error} Токен будет действовать только до закрытия плеера.")
+                        }
+                    };
+                    soundcloud::set_session_token(Some(token));
+                    message
+                }
+                None => match soundcloud::clear_stored_token() {
+                    Ok(()) => {
+                        soundcloud::set_session_token(None);
+                        "Сохранённый токен удалён.".into()
+                    }
+                    Err(error) => error,
+                },
+            });
+            let (busy, entry, status, buttons) =
+                (busy.clone(), entry.clone(), status.clone(), buttons.clone());
+            glib::MainContext::default().spawn_local(async move {
+                let message = task
+                    .await
+                    .unwrap_or_else(|_| "Связка ключей недоступна.".into());
+                busy.set(false);
+                if let Some(status) = status.upgrade() {
+                    status.set_text(&message);
+                }
+                if let Some(entry) = entry.upgrade() {
+                    entry.set_sensitive(true);
+                }
+                if let Some(buttons) = buttons.upgrade() {
+                    buttons.set_sensitive(true);
+                }
+            });
+        }
+    };
+
     let entry_save = entry.clone();
     let status_save = status.clone();
+    let save_access = update_access.clone();
     save.connect_clicked(move |_| {
         let raw = entry_save.text();
         let token = raw
@@ -3503,35 +3936,11 @@ fn show_soundcloud_token_dialog(parent: &gtk::Dialog) {
             .to_string();
         if let Err(error) = soundcloud::validate_token(&token) {
             status_save.set_text(&error);
-            return;
-        }
-        match soundcloud::save_token(&token) {
-            Ok(()) => {
-                soundcloud::set_session_token(Some(token));
-                entry_save.set_text("");
-                status_save.set_text(
-                    "Токен сохранён в связке ключей. Проверка доступа выполнится при загрузке.",
-                );
-            }
-            Err(error) => {
-                soundcloud::set_session_token(Some(token));
-                entry_save.set_text("");
-                status_save.set_text(&format!(
-                    "{error} Токен будет действовать только до закрытия плеера."
-                ));
-            }
+        } else {
+            save_access(Some(token));
         }
     });
-
-    let status_clear = status.clone();
-    clear.connect_clicked(move |_| {
-        if let Err(error) = soundcloud::clear_stored_token() {
-            status_clear.set_text(&error);
-            return;
-        }
-        soundcloud::set_session_token(None);
-        status_clear.set_text("Сохранённый токен удалён.");
-    });
+    clear.connect_clicked(move |_| update_access(None));
 
     motion::animate_buttons(dialog.upcast_ref());
     dialog.show_all();

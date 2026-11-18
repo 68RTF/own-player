@@ -131,18 +131,18 @@ fn decode(path: &Path, kind: Kind) -> Option<Decoded> {
     if shortest <= 0 {
         return None;
     }
-    let pixbuf = if shortest > limit {
-        let ratio = f64::from(limit) / f64::from(shortest);
-        Pixbuf::from_file_at_scale(
-            path,
-            (f64::from(width) * ratio).ceil() as i32,
-            (f64::from(height) * ratio).ceil() as i32,
-            true,
-        )
-        .ok()?
-    } else {
-        Pixbuf::from_file(path).ok()?
-    };
+    let longest = width.max(height);
+    // Keep wide or tall artwork bounded even when its short edge is already small.
+    let ratio = (f64::from(limit) / f64::from(shortest))
+        .min(f64::from(limit * 4) / f64::from(longest))
+        .min(1.0);
+    let pixbuf = Pixbuf::from_file_at_scale(
+        path,
+        (f64::from(width) * ratio).ceil() as i32,
+        (f64::from(height) * ratio).ceil() as i32,
+        true,
+    )
+    .ok()?;
     let current = kind == Kind::Current;
     let hue = current
         .then(|| {
@@ -179,28 +179,30 @@ fn rounded(pixbuf: &Pixbuf, size: i32, radius: f64) -> Option<Pixels> {
         scaled.add_alpha(false, 0, 0, 0).ok()?
     };
     let stride = scaled.rowstride() as usize;
-    let channels = scaled.n_channels() as usize;
     let bytes = scaled.read_pixel_bytes();
+    if radius == 0.0 {
+        return Some(Pixels {
+            bytes,
+            size,
+            stride: stride as i32,
+        });
+    }
     let mut data = bytes.as_ref().to_vec();
     let edge = size as f64;
     let radius = radius.min(edge / 2.0);
-    for py in 0..size {
-        for px in 0..size {
-            let fx = px as f64 + 0.5;
-            let fy = py as f64 + 0.5;
-            let cx = fx.clamp(radius, edge - radius);
-            let cy = fy.clamp(radius, edge - radius);
-            let dx = fx - cx;
-            let dy = fy - cy;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let alpha = if radius > 0.0 {
-                (radius - distance + 0.5).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            if alpha < 1.0 && channels == 4 {
-                let offset = py as usize * stride + px as usize * channels;
-                data[offset + 3] = (data[offset + 3] as f64 * alpha) as u8;
+    let corner = radius.ceil() as i32;
+    for y in 0..corner {
+        for x in 0..corner {
+            let dx = (radius - f64::from(x) - 0.5).max(0.0);
+            let dy = (radius - f64::from(y) - 0.5).max(0.0);
+            let alpha = (radius - dx.hypot(dy) + 0.5).clamp(0.0, 1.0);
+            if alpha < 1.0 {
+                for py in [y, size - 1 - y] {
+                    for px in [x, size - 1 - x] {
+                        let offset = py as usize * stride + px as usize * 4 + 3;
+                        data[offset] = (f64::from(data[offset]) * alpha) as u8;
+                    }
+                }
             }
         }
     }

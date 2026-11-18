@@ -16,30 +16,30 @@
 
 ## Установка
 
-Готовые пакеты для x86-64 находятся на [странице релиза v0.7.0](https://github.com/68RTF/veyra/releases/tag/v0.7.0). Скачай пакет для своей системы, открой терминал в папке с ним и выполни команду ниже. Если скачал другую версию, укажи её имя в команде.
+Готовые пакеты для x86-64 находятся на [странице релиза v0.7.1](https://github.com/68RTF/veyra/releases/tag/v0.7.1). Скачай пакет для своей системы, открой терминал в папке с ним и выполни команду ниже. Если скачал другую версию, укажи её имя в команде.
 
 ### Arch Linux
 
-Скачай `veyra-0.7.0-1-x86_64.pkg.tar.zst`:
+Скачай `veyra-0.7.1-1-x86_64.pkg.tar.zst`:
 
 ```sh
-sudo pacman -U ./veyra-0.7.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./veyra-0.7.1-1-x86_64.pkg.tar.zst
 ```
 
 ### Ubuntu 24.04
 
-Скачай `veyra_0.7.0_ubuntu24.04_amd64.deb`:
+Скачай `veyra_0.7.1_ubuntu24.04_amd64.deb`:
 
 ```sh
-sudo apt install ./veyra_0.7.0_ubuntu24.04_amd64.deb
+sudo apt install ./veyra_0.7.1_ubuntu24.04_amd64.deb
 ```
 
 ### Debian 13
 
-Скачай `veyra_0.7.0_debian13_amd64.deb`:
+Скачай `veyra_0.7.1_debian13_amd64.deb`:
 
 ```sh
-sudo apt install ./veyra_0.7.0_debian13_amd64.deb
+sudo apt install ./veyra_0.7.1_debian13_amd64.deb
 ```
 
 ### Из исходников
