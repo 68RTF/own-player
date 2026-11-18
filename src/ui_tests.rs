@@ -8,6 +8,7 @@ fn test_model() -> Rc<RefCell<Model>> {
         ],
         current: Some(0),
         library_revision: 1,
+        queue_metadata_changed: Default::default(),
         cover_pending: Default::default(),
         cover_attempted: Default::default(),
         metadata_ready: Default::default(),
@@ -39,6 +40,42 @@ fn manual_next_advances_even_with_repeat_one() {
     assert_eq!(next_index(0, 0, 1, 0), None);
 }
 
+#[test]
+fn metadata_follows_the_file_after_queue_edits() {
+    let model = test_model();
+    let mut state = model.borrow_mut();
+    let indices = state
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(index, track)| (track.path.clone(), index))
+        .collect();
+    let mut result = state.tracks[0].clone();
+    let path = result.path.clone();
+    result.title = "Теги из файла".into();
+    state.metadata_pending.insert(path.clone());
+    state.tracks.swap(0, 1);
+    let other = state.tracks[0].path.clone();
+
+    merge_metadata(&mut state, &indices, result.clone());
+    assert_eq!(state.tracks[0].path, other);
+    assert_eq!(state.tracks[1].title, result.title);
+    assert!(state.metadata_ready.contains(&path));
+    assert!(!state.metadata_pending.contains(&path));
+
+    state.tracks.pop();
+    state.metadata_pending.insert(path.clone());
+    merge_metadata(&mut state, &indices, result);
+    assert_eq!(state.tracks.len(), 1);
+    assert_eq!(state.tracks[0].path, other);
+    assert!(!state.metadata_pending.contains(&path));
+}
+
+fn read_saved_session() -> std::io::Result<Session> {
+    session::flush();
+    session::load()
+}
+
 fn pump(milliseconds: u64) {
     let until = Instant::now() + Duration::from_millis(milliseconds);
     let context = glib::MainContext::default();
@@ -47,6 +84,13 @@ fn pump(milliseconds: u64) {
             context.iteration(false);
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn pump_until(ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !ready() && Instant::now() < deadline {
+        pump(25);
     }
 }
 
@@ -87,7 +131,7 @@ fn gtk_smoke() {
     let artwork_primary = primary();
     theme::set_cover(None);
     assert_ne!(artwork_primary, primary(), "artwork must tint the theme");
-    let artwork = session::load().unwrap().paths[0].with_file_name("cover.png");
+    let artwork = read_saved_session().unwrap().paths[0].with_file_name("cover.png");
     theme::set_cover(Some(&artwork));
     assert_eq!(artwork_primary, primary());
     pump(240);
@@ -109,9 +153,9 @@ fn gtk_smoke() {
         .find(|button| button.tooltip_text().as_deref() == Some("Перемешать"))
         .unwrap();
     shuffle.emit_clicked();
-    assert!(shuffle.is_active() && session::load().unwrap().shuffle);
+    assert!(shuffle.is_active() && read_saved_session().unwrap().shuffle);
     shuffle.emit_clicked();
-    assert!(!shuffle.is_active() && !session::load().unwrap().shuffle);
+    assert!(!shuffle.is_active() && !read_saved_session().unwrap().shuffle);
     let repeat = widgets
         .iter()
         .filter_map(|w| w.downcast_ref::<gtk::Button>())
@@ -125,7 +169,7 @@ fn gtk_smoke() {
         repeat.emit_clicked();
         assert_eq!(repeat.tooltip_text().as_deref(), Some(caption));
         assert_eq!(repeat.style_context().has_class("active"), mode != 0);
-        assert_eq!(session::load().unwrap().repeat, mode);
+        assert_eq!(read_saved_session().unwrap().repeat, mode);
     }
     let play_position = || play.translate_coordinates(&window, 0, 0).unwrap();
     let now_title = widgets
@@ -219,12 +263,15 @@ fn gtk_smoke() {
         let row = list.row_at_index(index as i32).unwrap();
         let button = descendants(row.upcast_ref())
             .into_iter()
-            .find_map(|widget| widget.downcast::<gtk::MenuButton>().ok())
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.tooltip_text().as_deref() == Some("Действия с треком"))
             .unwrap();
-        button
-            .popup()
-            .unwrap()
-            .children()
+        button.emit_clicked();
+        let menu = gtk::Menu::for_attach_widget(&button)
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk::Menu>().ok())
+            .unwrap();
+        menu.children()
             .into_iter()
             .find_map(|widget| {
                 let item = widget.downcast::<gtk::MenuItem>().ok()?;
@@ -232,18 +279,19 @@ fn gtk_smoke() {
             })
             .unwrap()
             .activate();
+        menu.popdown();
         pump(180);
     };
-    let original_queue = session::load().unwrap().paths;
+    let original_queue = read_saved_session().unwrap().paths;
     action(2, "Переместить выше");
-    assert_eq!(session::load().unwrap().paths[1], original_queue[2]);
+    assert_eq!(read_saved_session().unwrap().paths[1], original_queue[2]);
     action(1, "Поставить следующим");
     assert_eq!(
-        session::load().unwrap().play_next.as_ref(),
+        read_saved_session().unwrap().play_next.as_ref(),
         Some(&original_queue[2])
     );
     action(1, "Убрать из очереди");
-    let edited = session::load().unwrap();
+    let edited = read_saved_session().unwrap();
     assert!(!edited.paths.contains(&original_queue[2]));
     assert!(edited.play_next.is_none());
     assert_eq!(edited.current_path.as_ref(), Some(&original_queue[0]));
@@ -263,6 +311,8 @@ fn gtk_smoke() {
         .filter_map(|w| w.downcast_ref::<gtk::Label>())
         .any(|label| label.text().starts_with("Двойной щелчок или Enter") && label.is_visible()));
     capture("search-empty");
+    search.emit_by_name::<()>("stop-search", &[]);
+    assert!(search.text().is_empty());
     search.set_text("   ");
     pump(350);
     assert!(!widgets
@@ -589,7 +639,7 @@ fn gtk_smoke() {
     assert_ne!(clock.text(), before);
     play.emit_clicked();
 
-    let directory = session::load().unwrap().paths[0]
+    let directory = read_saved_session().unwrap().paths[0]
         .parent()
         .unwrap()
         .to_path_buf();
@@ -647,22 +697,22 @@ fn gtk_smoke() {
     slider.set_value(1.10);
     assert!(!preset.is_active());
     pump(350);
-    assert!((session::load().unwrap().speed - 1.10).abs() < 0.001);
+    assert!((read_saved_session().unwrap().speed - 1.10).abs() < 0.001);
     preset.emit_clicked();
     assert!(preset.is_active());
     assert!((slider.value() - 1.25).abs() < 0.001);
     preset.emit_clicked();
     assert!(preset.is_active());
     covers.set_active(true);
-    assert!(session::load().unwrap().online_covers);
+    assert!(read_saved_session().unwrap().online_covers);
     covers.set_active(false);
-    assert!(!session::load().unwrap().online_covers);
+    assert!(!read_saved_session().unwrap().online_covers);
     covers.set_active(true);
     pump(400);
-    assert!(session::load().unwrap().online_covers);
-    assert!((session::load().unwrap().speed - 1.25).abs() < 0.001);
+    assert!(read_saved_session().unwrap().online_covers);
+    assert!((read_saved_session().unwrap().speed - 1.25).abs() < 0.001);
 
-    let source = session::load().unwrap().paths[0].with_file_name("playlist-test.csv");
+    let source = read_saved_session().unwrap().paths[0].with_file_name("playlist-test.csv");
     std::fs::write(
         &source,
         "id,title,artists,album,x,y,album_id\n1,Test,Artist,Album,,,42\n",
@@ -728,6 +778,44 @@ fn gtk_smoke() {
         "layout must fit minimum height: {:?}",
         window.size()
     );
+    let soundcloud_button = widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<gtk::Button>())
+        .find(|button| button.tooltip_text().as_deref() == Some("Скачать с SoundCloud"))
+        .unwrap();
+    let lookup_was_pending = Rc::new(Cell::new(false));
+    let lookup_finished = Rc::new(Cell::new(false));
+    let pending = lookup_was_pending.clone();
+    let finished = lookup_finished.clone();
+    glib::timeout_add_local_once(Duration::from_millis(160), move || {
+        if let Some(dialog) = gtk::Window::list_toplevels()
+            .into_iter()
+            .find_map(|widget| {
+                let dialog = widget.downcast::<gtk::Dialog>().ok()?;
+                (dialog.title().as_deref() == Some("Скачать с SoundCloud")).then_some(dialog)
+            })
+        {
+            let has_status = |text: &str| {
+                descendants(dialog.upcast_ref())
+                    .iter()
+                    .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                    .any(|label| label.text() == text)
+            };
+            pending.set(has_status("Проверяем доступ…"));
+            glib::timeout_add_local_once(Duration::from_millis(1300), move || {
+                finished.set(
+                    descendants(dialog.upcast_ref())
+                        .iter()
+                        .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                        .any(|label| label.text() == "Токен не задан"),
+                );
+                dialog.response(gtk::ResponseType::Close);
+            });
+        }
+    });
+    soundcloud_button.emit_clicked();
+    assert!(lookup_was_pending.get());
+    assert!(lookup_finished.get());
     window.close();
     pump(300);
     build_ui(&app);
@@ -770,7 +858,7 @@ fn gtk_smoke() {
         state.tracks[0].album =
             "Очень длинное название альбома с дополнительной информацией".into();
     }
-    let image_dir = session::load().unwrap().paths[0]
+    let image_dir = read_saved_session().unwrap().paths[0]
         .parent()
         .unwrap()
         .to_path_buf();
@@ -864,7 +952,7 @@ fn gtk_smoke() {
     let large_queue = test_model();
     {
         let mut state = large_queue.borrow_mut();
-        state.tracks = (0..1000)
+        state.tracks = (0..10_000)
             .map(|i| {
                 let mut track = preview_track(image_dir.join(format!("queue-{i}.wav")));
                 track.title = format!("Трек {i} {}", "длинное название ".repeat(8));
@@ -874,9 +962,9 @@ fn gtk_smoke() {
                 track
             })
             .collect();
-        state.current = Some(999);
+        state.current = Some(9_999);
     }
-    let queue = build_queue_page(&large_queue);
+    let (queue, search) = build_queue_page(&large_queue);
     let queue_window = gtk::Window::new(gtk::WindowType::Toplevel);
     queue_window.set_default_size(640, 420);
     queue_window.add(&queue);
@@ -887,15 +975,56 @@ fn gtk_smoke() {
         .iter()
         .find_map(|w| w.downcast_ref::<gtk::ListBox>())
         .unwrap();
-    let scroll = queue_widgets
+    let number = queue_widgets
         .iter()
-        .find_map(|w| w.downcast_ref::<gtk::ScrolledWindow>())
+        .filter_map(|w| w.downcast_ref::<gtk::Entry>())
+        .find(|entry| entry.tooltip_text().as_deref() == Some("Страница очереди"))
         .unwrap();
-    assert_eq!(list.children().len(), 1000);
-    let adjustment = scroll.vadjustment();
-    adjustment.set_value(adjustment.upper() - adjustment.page_size());
+    let next = queue_widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<gtk::Button>())
+        .find(|button| button.tooltip_text().as_deref() == Some("Следующая страница"))
+        .unwrap();
+    let queue_actions = queue_widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<gtk::MenuButton>())
+        .find(|button| button.tooltip_text().as_deref() == Some("Действия с очередью"))
+        .unwrap();
+    let jump = queue_actions
+        .popup()
+        .unwrap()
+        .children()
+        .into_iter()
+        .find_map(|w| {
+            let item = w.downcast::<gtk::MenuItem>().ok()?;
+            (item.label().as_deref() == Some("Показать текущий трек")).then_some(item)
+        })
+        .unwrap();
+
+    pump_until(|| list.row_at_index(QUEUE_PAGE_SIZE as i32 - 1).is_some());
+    assert_eq!(list.children().len(), QUEUE_PAGE_SIZE);
+    assert!(
+        queue_widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|label| label.style_context().has_class("queue-page-count")
+                && label.text() == "/ 84")
+    );
+    next.emit_clicked();
+    pump(300);
+    assert_eq!(number.text(), "2");
+    pump_until(|| list.row_at_index(QUEUE_PAGE_SIZE as i32 - 1).is_some());
+    assert_eq!(list.children().len(), QUEUE_PAGE_SIZE);
+    number.set_text("70");
+    number.emit_by_name::<()>("activate", &[]);
+    pump(300);
+    assert_eq!(number.text(), "70");
+    jump.activate();
     pump(450);
-    let last = list.row_at_index(999).unwrap();
+    assert_eq!(number.text(), "84");
+    pump_until(|| list.row_at_index(39).is_some());
+    assert_eq!(list.children().len(), 40);
+    let last = list.row_at_index(39).unwrap();
     assert!(last.style_context().has_class("playing"));
     assert!(descendants(last.upcast_ref())
         .iter()
@@ -906,6 +1035,18 @@ fn gtk_smoke() {
     pump(220);
     assert!(last.is_selected() && last.is_focus());
     capture("queue-large");
+    search.set_text("трек 5678 длинное");
+    pump(400);
+    assert_eq!(number.text(), "1");
+    assert_eq!(list.children().len(), 1);
+    assert!(descendants(list.upcast_ref())
+        .iter()
+        .filter_map(|w| w.downcast_ref::<gtk::Label>())
+        .any(|label| label.text().starts_with("Трек 5678")));
+    search.emit_by_name::<()>("stop-search", &[]);
+    pump(400);
+    pump_until(|| list.row_at_index(QUEUE_PAGE_SIZE as i32 - 1).is_some());
+    assert_eq!(list.children().len(), QUEUE_PAGE_SIZE);
     {
         let mut state = large_queue.borrow_mut();
         state.tracks.clear();
@@ -968,19 +1109,20 @@ fn gtk_smoke() {
     window.close();
     pump(450);
 
-    let saved = session::load().unwrap();
+    let saved = read_saved_session().unwrap();
     let folder = saved.paths[0].parent().unwrap().to_path_buf();
     let gone = folder.join("temporarily-unavailable.wav");
     let broken = folder.join("broken.wav");
     std::fs::write(&broken, "broken audio").unwrap();
     let good = saved.paths[0].clone();
-    session::save(&Session {
+    session::save(Session {
         paths: vec![broken.clone(), good.clone(), gone.clone()],
         current_path: Some(gone.clone()),
         repeat: 0,
         ..saved
     })
     .unwrap();
+    session::flush();
     let restored = test_model();
     restored.borrow_mut().tracks.clear();
     restore_session(&restored);
@@ -988,7 +1130,7 @@ fn gtk_smoke() {
     assert_eq!(restored.borrow().tracks[2].path, gone);
     save_session(&restored);
     assert_eq!(
-        session::load().unwrap().paths,
+        read_saved_session().unwrap().paths,
         vec![broken, good, gone.clone()]
     );
 
@@ -1025,7 +1167,7 @@ fn gtk_smoke() {
         restored.borrow().mpv.as_ref().unwrap().loaded,
         "manual next must preserve playback at the end"
     );
-    let before = session::load().unwrap();
+    let before = read_saved_session().unwrap();
     let current = before.current_path.as_ref().unwrap();
     let first = &before.paths[0];
     assert!(edit_queue(
@@ -1033,18 +1175,18 @@ fn gtk_smoke() {
         current,
         QueueEdit::Drop(first, false)
     ));
-    let edited = session::load().unwrap();
+    let edited = read_saved_session().unwrap();
     assert_eq!(edited.paths.first(), Some(current));
     assert_eq!(edited.current_path, before.current_path);
     assert!(restored.borrow().mpv.as_ref().unwrap().loaded);
     let next = edited.paths.last().unwrap();
     assert!(edit_queue(&restored, next, QueueEdit::PlayNext));
     next_track(&restored, 1, false);
-    let advanced = session::load().unwrap();
+    let advanced = read_saved_session().unwrap();
     assert_eq!(advanced.current_path.as_ref(), Some(next));
     assert!(advanced.play_next.is_none());
     clear_queue(&restored);
-    assert!(session::load().unwrap().paths.is_empty());
+    assert!(read_saved_session().unwrap().paths.is_empty());
     assert!(!restored.borrow().mpv.as_ref().unwrap().loaded);
     append_paths(&restored, vec![folder.join("empty")]);
     pump(350);
@@ -1054,4 +1196,67 @@ fn gtk_smoke() {
         .as_deref()
         .unwrap()
         .contains("не найдены"));
+}
+
+#[test]
+#[ignore = "Run under Xvfb to measure construction of a 10000-track queue"]
+fn gtk_queue_benchmark() {
+    gtk::init().unwrap();
+    theme::install(&gtk::gdk::Screen::default().unwrap());
+    for _ in 0..3 {
+        let model = test_model();
+        model.borrow_mut().tracks = (0..10_000)
+            .map(|index| {
+                let mut track = preview_track(PathBuf::from(format!("/fixture/track-{index}.wav")));
+                track.title = format!("Трек {index} {}", "длинное название ".repeat(8));
+                track.duration = 120.0;
+                track
+            })
+            .collect();
+        let (page, _) = build_queue_page(&model);
+        let list = descendants(&page)
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::ListBox>().ok())
+            .unwrap();
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        window.set_default_size(900, 620);
+        window.add(&page);
+        let start = Instant::now();
+        let longest_gap = Rc::new(Cell::new(Duration::ZERO));
+        let maximum = longest_gap.clone();
+        let mut last = start;
+        let timer = glib::timeout_add_local(Duration::from_millis(16), move || {
+            let now = Instant::now();
+            maximum.set(maximum.get().max(now - last));
+            last = now;
+            glib::ControlFlow::Continue
+        });
+        window.show_all();
+        let mut first_row = None;
+        let mut first_page = None;
+        let context = glib::MainContext::default();
+        while start.elapsed() < Duration::from_secs(4) {
+            if !context.iteration(false) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if list.row_at_index(0).is_some() && first_row.is_none() {
+                first_row = Some(start.elapsed());
+            }
+            if list.row_at_index(QUEUE_PAGE_SIZE as i32 - 1).is_some() {
+                first_page = Some(start.elapsed());
+                break;
+            }
+        }
+        pump(80);
+        assert_eq!(list.children().len(), QUEUE_PAGE_SIZE);
+        eprintln!(
+            "queue=10000 first_row_ms={} first_page_ms={} longest_gtk_gap_ms={}",
+            first_row.unwrap().as_millis(),
+            first_page.unwrap().as_millis(),
+            longest_gap.get().as_millis()
+        );
+        timer.remove();
+        window.close();
+        pump(100);
+    }
 }

@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, OnceLock};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Session {
@@ -65,10 +66,60 @@ pub(crate) fn load() -> io::Result<Session> {
     read_from(&path)
 }
 
-pub(crate) fn save(session: &Session) -> io::Result<()> {
+enum WriteRequest {
+    Save(PathBuf, Session),
+    Flush(mpsc::Sender<()>),
+}
+
+static WRITER: OnceLock<mpsc::Sender<WriteRequest>> = OnceLock::new();
+
+pub(crate) fn save(session: Session) -> io::Result<()> {
     let path = location()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Не найден домашний каталог"))?;
-    write_to(&path, session)
+    let sender = WRITER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || write_sessions(&receiver));
+        sender
+    });
+    sender
+        .send(WriteRequest::Save(path, session))
+        .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))
+}
+
+pub(crate) fn flush() {
+    if let Some(writer) = WRITER.get() {
+        let (sender, receiver) = mpsc::channel();
+        if writer.send(WriteRequest::Flush(sender)).is_ok() {
+            let _ = receiver.recv();
+        }
+    }
+}
+
+fn write_sessions(receiver: &mpsc::Receiver<WriteRequest>) {
+    let mut next = None;
+    while let Some(request) = next.take().or_else(|| receiver.recv().ok()) {
+        match request {
+            WriteRequest::Save(path, mut session) => {
+                while let Ok(request) = receiver.try_recv() {
+                    match request {
+                        WriteRequest::Save(new_path, new_session) if new_path == path => {
+                            session = new_session;
+                        }
+                        other => {
+                            next = Some(other);
+                            break;
+                        }
+                    }
+                }
+                if let Err(error) = write_to(&path, &session) {
+                    eprintln!("Не удалось сохранить очередь: {error}");
+                }
+            }
+            WriteRequest::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
 }
 
 fn read_from(path: &Path) -> io::Result<Session> {
