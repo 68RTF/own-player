@@ -2,11 +2,13 @@ use crate::{Lyric, Track};
 use serde_json::Value;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub(crate) fn collect_audio(path: &Path, out: &mut Vec<PathBuf>) {
     // Canonical directory identities prevent cycles through symbolic links.
@@ -89,33 +91,34 @@ pub(crate) fn read_track(path: PathBuf) -> Track {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Без названия");
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_format",
-            "-show_streams",
-            "-of",
-            "json",
-        ])
-        .arg(&path)
-        .output()
-        .ok();
-    let output_ok = output
-        .as_ref()
-        .map(|result| result.status.success())
-        .unwrap_or(false);
+    let output = run_media_tool(
+        Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_format",
+                "-show_streams",
+                "-of",
+                "json",
+            ])
+            .arg(&path),
+        Duration::from_secs(8),
+    )
+    .ok()
+    .flatten();
+    let output_ok = output.is_some();
     let mut title = preview.title;
     let mut artist = preview.artist;
     let mut album = String::new();
     let mut duration = 0.0;
     let mut embedded_lyrics = String::new();
     if let Some(output) = output {
-        if let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) {
+        if let Ok(value) = serde_json::from_slice::<Value>(&output) {
             if let Some(format) = value.get("format") {
                 duration = format["duration"]
                     .as_str()
-                    .and_then(|v| v.parse().ok())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|duration| duration.is_finite() && *duration >= 0.0)
                     .unwrap_or(0.0);
                 if let Some(tags) = format.get("tags") {
                     if let Some(tag_title) = tag(tags, &["title"]) {
@@ -273,12 +276,10 @@ pub(crate) fn extract_cover(path: &Path) -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    if let Some(stem) = path.file_stem() {
-        for extension in ["jpg", "jpeg", "png", "webp"] {
-            let candidate = path.parent()?.join(stem).with_extension(extension);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    for extension in ["jpg", "jpeg", "png", "webp"] {
+        let candidate = path.with_extension(extension);
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     let root = std::env::var_os("XDG_CACHE_HOME")
@@ -301,30 +302,88 @@ pub(crate) fn extract_cover(path: &Path) -> Option<PathBuf> {
         });
     let name = format!("{key:016x}-{}-{modified}.jpg", metadata.len());
     let output = cache.join(name);
-    if output.is_file() {
+    if fs::metadata(&output).is_ok_and(|metadata| metadata.len() > 0) {
         return Some(output);
     }
-    let result = Command::new("ffmpeg")
-        .args(["-v", "error", "-y", "-i"])
-        .arg(path)
-        .args([
-            "-map",
-            "0:v:0",
-            "-frames:v",
-            "1",
-            "-vf",
-            "scale=900:900:force_original_aspect_ratio=decrease",
-        ])
-        .arg(&output)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    if result.success() && output.is_file() {
+    let temporary = output.with_extension(format!(
+        "{}-{}.part.jpg",
+        std::process::id(),
+        COVER_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = run_media_tool(
+        Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(path)
+            .args([
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=900:900:force_original_aspect_ratio=decrease",
+            ])
+            .arg(&temporary),
+        Duration::from_secs(12),
+    );
+    if matches!(result, Ok(Some(_))) && fs::rename(&temporary, &output).is_ok() {
         Some(output)
     } else {
+        let _ = fs::remove_file(&temporary);
         None
     }
+}
+
+static COVER_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn run_media_tool(command: &mut Command, timeout: Duration) -> io::Result<Option<Vec<u8>>> {
+    const MAX_OUTPUT: usize = 2 * 1024 * 1024;
+    let (mut reader, writer) = UnixStream::pair()?;
+    reader.set_nonblocking(true)?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Command retains the writer after spawn. Close the parent's copy.
+    command.stdout(Stdio::null());
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        let mut buffer = Vec::new();
+        let mut chunk = [0; 8192];
+        let mut status: Option<bool> = None;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            match reader.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(length) => {
+                    buffer.extend_from_slice(&chunk[..length]);
+                    if buffer.len() > MAX_OUTPUT {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+            if let Some(status) = status {
+                return Ok(status.then_some(buffer));
+            }
+            if let Some(done) = child.try_wait()? {
+                // Drain bytes written between the previous read and process exit.
+                status = Some(done.success());
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 fn tag(value: &Value, keys: &[&str]) -> Option<String> {
@@ -391,6 +450,21 @@ pub(crate) fn parse_lyrics(text: &str) -> Vec<Lyric> {
 #[cfg(test)]
 mod tests {
     use super::{metadata_cache_path, parse_filename, parse_lyrics, read_track};
+
+    #[test]
+    fn media_tool_times_out_and_captures_stdout() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        let output =
+            super::run_media_tool(Command::new("printf").arg("tags"), Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(output.as_deref(), Some(&b"tags"[..]));
+        let error =
+            super::run_media_tool(Command::new("sleep").arg("5"), Duration::from_millis(30))
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn directory_import_handles_symlink_cycles() {

@@ -2,22 +2,25 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) struct Mpv {
     child: Child,
     socket: UnixStream,
+    pub(crate) event_source: Option<glib::SourceId>,
     socket_path: PathBuf,
     buffer: Vec<u8>,
     req: u64,
     outgoing: VecDeque<u8>,
-    awaiting_start: usize,
-    pub(crate) pos: f64,
+    awaiting_start: VecDeque<u64>,
+    pos: f64,
+    sampled_at: Instant,
     pub(crate) duration: f64,
     pub(crate) paused: bool,
     pub(crate) loaded: bool,
@@ -83,12 +86,14 @@ impl Mpv {
                 let mut player = Self {
                     child,
                     socket,
+                    event_source: None,
                     socket_path: path,
                     buffer: Vec::new(),
                     req: 0,
                     outgoing: VecDeque::new(),
-                    awaiting_start: 0,
+                    awaiting_start: VecDeque::new(),
                     pos: 0.0,
+                    sampled_at: Instant::now(),
                     duration: 0.0,
                     paused: true,
                     loaded: false,
@@ -97,7 +102,7 @@ impl Mpv {
                     failed: false,
                     error: None,
                 };
-                for property in ["time-pos", "duration", "pause", "volume"] {
+                for property in ["time-pos", "duration", "pause"] {
                     player.req += 1;
                     let _ = player.command(json!(["observe_property", player.req, property]));
                 }
@@ -117,6 +122,14 @@ impl Mpv {
         None
     }
 
+    pub(crate) fn socket_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
+    }
+
+    pub(crate) fn has_outgoing(&self) -> bool {
+        !self.outgoing.is_empty()
+    }
+
     pub(crate) fn command(&mut self, command: Value) -> std::io::Result<()> {
         self.req += 1;
         let is_load = command[0] == "loadfile";
@@ -127,7 +140,7 @@ impl Mpv {
         self.outgoing.extend(format!("{object}\n").bytes());
         self.flush()?;
         if is_load {
-            self.awaiting_start += 1;
+            self.awaiting_start.push_back(self.req);
         }
         Ok(())
     }
@@ -147,63 +160,109 @@ impl Mpv {
         Ok(())
     }
 
-    pub(crate) fn read_events(&mut self) {
-        if let Err(error) = self.flush() {
-            self.error = Some(format!("Не удалось отправить команду mpv: {error}"));
-            self.loaded = false;
-            self.paused = true;
+    pub(crate) fn set_position(&mut self, position: f64) {
+        self.pos = position;
+        self.sampled_at = Instant::now();
+    }
+
+    pub(crate) fn position(&self, speed: f64) -> f64 {
+        if self.paused || !self.loaded {
+            return self.paused_lyric_position.unwrap_or(self.pos);
         }
+        let elapsed = self.sampled_at.elapsed().min(Duration::from_millis(120));
+        if self.duration > 0.0 {
+            (self.pos + elapsed.as_secs_f64() * speed).min(self.duration)
+        } else {
+            self.pos
+        }
+    }
+
+    pub(crate) fn read_events(&mut self) -> std::io::Result<()> {
+        self.flush()?;
         let mut chunk = [0u8; 4096];
         loop {
             match self.socket.read(&mut chunk) {
-                Ok(0) => {
-                    self.loaded = false;
-                    self.paused = true;
-                    if self.error.is_none() {
-                        self.error = Some("Связь с mpv прервалась. Перезапусти плеер.".into());
-                    }
-                    break;
-                }
+                Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
                 Ok(n) => self.buffer.extend_from_slice(&chunk[..n]),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             }
         }
-        while let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = self.buffer.drain(..=end).collect();
-            if let Ok(value) = serde_json::from_slice::<Value>(&line) {
-                match value["name"].as_str().unwrap_or("") {
-                    "time-pos" => self.pos = value["data"].as_f64().unwrap_or(self.pos),
-                    "duration" => self.duration = value["data"].as_f64().unwrap_or(self.duration),
-                    "pause" => self.paused = value["data"].as_bool().unwrap_or(self.paused),
-                    _ => {}
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let mut consumed = 0;
+        for line in buffer.split_inclusive(|byte| *byte == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
+            }
+            consumed += line.len();
+            if let Ok(value) = serde_json::from_slice::<Value>(line) {
+                self.handle_event(&value);
+            }
+        }
+        buffer.drain(..consumed);
+        self.buffer = buffer;
+        Ok(())
+    }
+
+    fn handle_event(&mut self, value: &Value) {
+        match value["name"].as_str().unwrap_or("") {
+            "time-pos" => {
+                if let Some(position) = value["data"].as_f64() {
+                    self.set_position(position);
                 }
-                let event = value["event"].as_str();
-                if event == Some("start-file") {
-                    self.awaiting_start = self.awaiting_start.saturating_sub(1);
+            }
+            "duration" => self.duration = value["data"].as_f64().unwrap_or(self.duration),
+            "pause" => {
+                if let Some(paused) = value["data"].as_bool() {
+                    self.paused = paused;
+                    self.sampled_at = Instant::now();
                 }
-                if event == Some("end-file") && self.awaiting_start == 0 {
-                    match value["reason"].as_str() {
-                        Some("eof") => {
-                            self.ended = true;
-                            self.loaded = false;
-                        }
-                        Some("error") => {
-                            self.failed = true;
-                            self.loaded = false;
-                            self.paused = true;
-                            self.error = Some("Не удалось воспроизвести файл. Проверь, что он доступен и не повреждён.".into());
-                        }
-                        _ => {}
-                    }
+            }
+            _ => {}
+        }
+        match value["event"].as_str() {
+            Some("start-file") => {
+                self.awaiting_start.pop_front();
+            }
+            Some("end-file") if self.awaiting_start.is_empty() => match value["reason"].as_str() {
+                Some("eof") => {
+                    self.ended = true;
+                    self.loaded = false;
+                }
+                Some("error") => self.playback_failed(),
+                _ => {}
+            },
+            _ => {}
+        }
+        if value["error"]
+            .as_str()
+            .is_some_and(|error| error != "success")
+        {
+            if let Some(request) = value["request_id"].as_u64() {
+                let failed_latest = self.awaiting_start.back() == Some(&request);
+                self.awaiting_start.retain(|&pending| pending != request);
+                if failed_latest {
+                    self.playback_failed();
                 }
             }
         }
+    }
+
+    fn playback_failed(&mut self) {
+        self.failed = true;
+        self.loaded = false;
+        self.paused = true;
+        self.error =
+            Some("Не удалось воспроизвести файл. Проверь, что он доступен и не повреждён.".into());
     }
 }
 
 impl Drop for Mpv {
     fn drop(&mut self) {
+        if let Some(source) = self.event_source.take() {
+            source.remove();
+        }
         let _ = self.command(json!(["quit"]));
         let _ = self.child.kill();
         let _ = self.child.wait();

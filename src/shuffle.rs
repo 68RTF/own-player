@@ -30,10 +30,10 @@ impl ShuffleOrder {
         Some(&self.history[previous])
     }
 
-    pub(crate) fn can_advance<'a>(&self, tracks: impl Iterator<Item = &'a Path>) -> bool {
+    pub(crate) fn can_advance(&self, track_count: usize) -> bool {
         self.cursor
             .is_some_and(|cursor| cursor + 1 < self.history.len())
-            || tracks.into_iter().any(|path| !self.played.contains(path))
+            || self.played.len() < track_count
     }
 
     pub(crate) fn next<'a>(

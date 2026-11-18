@@ -84,15 +84,17 @@ pub(crate) fn clear_stored_token() -> Result<(), String> {
     if !keyring_available() {
         return Ok(());
     }
-    let status = Command::new("secret-tool")
+    let output = Command::new("secret-tool")
         .args(["clear", "service", TOKEN_SERVICE, "kind", TOKEN_KIND])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|error| format!("secret-tool: {error}"))?;
-    // `clear` returns non-zero when there is nothing to remove.
-    let _ = status;
-    Ok(())
+    if output.status.success() || (output.status.code() == Some(1) && output.stderr.is_empty()) {
+        Ok(())
+    } else {
+        Err("Не удалось удалить токен из связки ключей.".into())
+    }
 }
 
 pub(crate) fn set_session_token(token: Option<String>) {

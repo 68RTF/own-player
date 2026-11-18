@@ -27,7 +27,7 @@ use files::*;
 use library::*;
 
 pub(crate) use auth::{
-    clear_stored_token, get_token, save_token, set_session_token, token_summary, validate_token,
+    clear_stored_token, save_token, set_session_token, token_summary, validate_token,
 };
 pub(crate) use files::default_download_dir;
 
@@ -185,8 +185,12 @@ impl Job {
     }
 }
 
-pub(crate) fn start_library(dir: PathBuf, token: Option<String>, tx: Sender<Event>) -> Job {
+pub(crate) fn start_library(dir: PathBuf, tx: Sender<Event>) -> Job {
     start_worker(dir, tx, move |dir, cancel, tx| {
+        let token = auth::get_token();
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ScError::Cancelled);
+        }
         let token = token.ok_or(ScError::AuthRequired)?;
         let mut summary = BatchSummary::default();
         run_library(dir, &token, &Endpoints::default(), cancel, tx, &mut summary)?;
@@ -201,8 +205,12 @@ pub(crate) fn start_library(dir: PathBuf, token: Option<String>, tx: Sender<Even
     })
 }
 
-pub(crate) fn start(url: String, dir: PathBuf, token: Option<String>, tx: Sender<Event>) -> Job {
+pub(crate) fn start(url: String, dir: PathBuf, tx: Sender<Event>) -> Job {
     start_worker(dir, tx, move |dir, cancel, tx| {
+        let token = auth::get_token();
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ScError::Cancelled);
+        }
         run_job(
             &url,
             dir,
