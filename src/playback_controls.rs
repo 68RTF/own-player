@@ -1,10 +1,45 @@
 use super::*;
 
-pub(super) fn build(model: &Rc<RefCell<Model>>) -> gtk::Widget {
+mod timeline {
+    use gtk::subclass::prelude::*;
+
+    #[derive(Default)]
+    pub struct Timeline;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Timeline {
+        const NAME: &'static str = "VeyraTimeline";
+        type Type = super::Timeline;
+        type ParentType = gtk::Box;
+    }
+
+    impl ObjectImpl for Timeline {}
+    impl WidgetImpl for Timeline {
+        fn preferred_width(&self) -> (i32, i32) {
+            let (minimum, _) = self.parent_preferred_width();
+            (minimum, minimum.max(704))
+        }
+    }
+    impl ContainerImpl for Timeline {}
+    impl BoxImpl for Timeline {}
+}
+
+glib::wrapper! {
+    pub struct Timeline(ObjectSubclass<timeline::Timeline>)
+        @extends gtk::Box, gtk::Container, gtk::Widget;
+}
+
+pub(super) fn build(
+    model: &Rc<RefCell<Model>>,
+    pages: &gtk::Stack,
+    player_views: &gtk::Stack,
+) -> gtk::Widget {
     let panel = gtk::Box::new(gtk::Orientation::Vertical, 4);
     panel.style_context().add_class("player-bar");
 
-    let seek_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let seek_row: Timeline = glib::Object::new();
+    seek_row.set_spacing(12);
+    seek_row.set_halign(gtk::Align::Center);
     let time = gtk::Label::new(Some("0:00"));
     time.style_context().add_class("timecode");
     let seek = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, SEEK_STEPS, 1.0);
@@ -60,7 +95,24 @@ pub(super) fn build(model: &Rc<RefCell<Model>>) -> gtk::Widget {
     now_text.pack_start(&now, false, false, 0);
     now_text.pack_start(&now_artist, false, false, 0);
     now_box.pack_start(&now_text, true, true, 0);
+    now_box.show_all();
+    now_box.set_no_show_all(true);
     row.pack_start(&now_box, true, true, 0);
+
+    let update_card = {
+        let pages = pages.downgrade();
+        let views = player_views.downgrade();
+        move |_: &gtk::Stack| {
+            if let (Some(pages), Some(views)) = (pages.upgrade(), views.upgrade()) {
+                let on_artwork = pages.visible_child_name().as_deref() == Some(PAGE_NAMES[0])
+                    && views.visible_child_name().as_deref() == Some("artwork");
+                now_box.set_visible(!on_artwork);
+            }
+        }
+    };
+    update_card(pages);
+    pages.connect_visible_child_name_notify(update_card.clone());
+    player_views.connect_visible_child_name_notify(update_card);
 
     let shuffle = gtk::ToggleButton::new();
     shuffle.set_focus_on_click(false);
@@ -399,7 +451,10 @@ pub(super) fn build(model: &Rc<RefCell<Model>>) -> gtk::Widget {
                 |seconds| format!("−{}", format_time(seconds as f64)),
             ));
         }
-        let playing = player.is_some_and(|player| !player.paused);
+        let playing = state
+            .mpv
+            .as_ref()
+            .is_some_and(|player| player.has_track() && !player.paused);
         if rendered_playing != Some(playing) {
             rendered_playing = Some(playing);
             set_play_icon(&play_tick, playing);
@@ -560,7 +615,7 @@ fn toggle_play(model: &Rc<RefCell<Model>>) -> bool {
     let Some(player) = state.mpv.as_mut() else {
         return false;
     };
-    if player.loaded {
+    if player.has_track() {
         if player.command(json!(["cycle", "pause"])).is_ok() {
             player.paused = !player.paused;
             state.updates.request();

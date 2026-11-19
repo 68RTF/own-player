@@ -1,6 +1,6 @@
 use super::*;
 
-fn test_model() -> Rc<RefCell<Model>> {
+pub(super) fn test_model() -> Rc<RefCell<Model>> {
     Rc::new(RefCell::new(Model {
         updates: Rc::default(),
         tracks: vec![
@@ -29,6 +29,7 @@ fn test_model() -> Rc<RefCell<Model>> {
         imports_pending: 0,
         failed_tracks: Default::default(),
         mpv: None,
+        mpv_process: None,
     }))
 }
 
@@ -196,6 +197,19 @@ fn gtk_smoke() {
         .find(|widget| widget.style_context().has_class("now-title"))
         .and_then(|widget| widget.downcast_ref::<gtk::Label>())
         .unwrap();
+    assert!(!now_title.is_mapped());
+    let timeline = widgets
+        .iter()
+        .find(|widget| widget.style_context().has_class("timeline"))
+        .unwrap();
+    let center_x = |widget: &gtk::Widget| {
+        widget
+            .translate_coordinates(&window, widget.allocated_width() / 2, 0)
+            .unwrap()
+            .0
+    };
+    assert!((center_x(timeline) - center_x(play.upcast_ref())).abs() <= 1);
+    assert!((600..=720).contains(&timeline.allocated_width()));
     let original_title = now_title.text();
     let mute = widgets
         .iter()
@@ -273,13 +287,37 @@ fn gtk_smoke() {
     play.emit_clicked();
     pump(700);
     assert_eq!(play.tooltip_text().as_deref(), Some("Пауза"));
+    let record = widgets
+        .iter()
+        .find(|w| w.style_context().has_class("vinyl"))
+        .unwrap();
+    let record_pixels = || {
+        let mut surface = gtk::cairo::ImageSurface::create(
+            gtk::cairo::Format::ARgb32,
+            record.allocated_width(),
+            record.allocated_height(),
+        )
+        .unwrap();
+        record.draw(&gtk::cairo::Context::new(&surface).unwrap());
+        let pixels = surface.data().unwrap().to_vec();
+        pixels
+    };
+    let moving = record_pixels();
+    pump(160);
+    assert!(
+        moving != record_pixels(),
+        "the record should rotate during playback"
+    );
     assert!(widgets
         .iter()
         .filter(|w| w.style_context().has_class("timecode"))
         .filter_map(|w| w.downcast_ref::<gtk::Label>())
         .any(|label| label.text().starts_with("−0:")));
     play.emit_clicked();
-    pump(300);
+    pump(550);
+    let stopped = record_pixels();
+    pump(160);
+    assert!(stopped == record_pixels(), "the paused record should stop");
     assert_eq!(play.tooltip_text().as_deref(), Some("Воспроизвести"));
     assert!(widgets
         .iter()
@@ -305,6 +343,7 @@ fn gtk_smoke() {
         .iter()
         .take(4)
         .all(|cover| cover.visible_child_name().as_deref() == Some("image")));
+    assert!(now_title.is_mapped());
     capture("queue");
     let action = |index: usize, name: &str| {
         let list = descendants(window.upcast_ref())
@@ -396,6 +435,19 @@ fn gtk_smoke() {
     capture("lyrics-action-keyboard");
     lyrics_action.emit_clicked();
     pump(350);
+    assert!(now_title.is_mapped());
+    let seek_hint = widgets
+        .iter()
+        .filter_map(|w| w.downcast_ref::<gtk::Label>())
+        .find(|label| label.text().starts_with("Двойной щелчок"))
+        .unwrap();
+    assert!(seek_hint.is_mapped());
+    assert!(
+        read_saved_session()
+            .unwrap()
+            .appearance
+            .lyrics_seek_hint_seen
+    );
     capture("lyrics");
     let back = widgets
         .iter()
@@ -432,7 +484,9 @@ fn gtk_smoke() {
             .any(|w| w.is::<gtk::DrawingArea>()),
         "lyrics must have no progress bars"
     );
+    assert!((896..=900).contains(&lyrics_list.allocated_width()));
     let lyric_row = lyrics_list.row_at_index(2).unwrap();
+    assert_eq!(lyric_row.tooltip_text(), Some(seek_hint.text()));
     lyrics_list.emit_by_name::<()>("row-activated", &[&lyric_row]);
     play.emit_clicked();
     pump(1300);
@@ -622,6 +676,19 @@ fn gtk_smoke() {
     }
     pump(350);
     capture("compact-player");
+    lyrics_action.emit_clicked();
+    pump(350);
+    assert!(!seek_hint.is_mapped());
+    assert!(lyrics_list.allocated_width() < 900);
+    let label = first.child().unwrap().downcast::<gtk::Label>().unwrap();
+    label.set_text(&"Очень длинная строка песни ".repeat(12));
+    pump(220);
+    assert!(label.layout().unwrap().line_count() > 1);
+    assert!(label.allocated_width() <= lyrics_list.allocated_width());
+    first.grab_focus();
+    assert!(first.is_focus());
+    back.emit_clicked();
+    pump(350);
     let settings = widgets
         .iter()
         .filter_map(|w| w.downcast_ref::<gtk::Button>())
@@ -832,6 +899,7 @@ fn gtk_smoke() {
         "paused settings should not redraw at idle"
     );
     page.disconnect(handler);
+    assert!(now_title.is_mapped());
     capture("settings");
     settings.emit_clicked();
     pump(300);
@@ -976,8 +1044,13 @@ fn gtk_smoke() {
             if width < 680 { 16 } else { 32 }
         );
         let right_margin = width - details_x - details.allocated_width();
+        let record = elements
+            .iter()
+            .find(|w| w.style_context().has_class("vinyl"))
+            .unwrap();
+        assert!(record.is_mapped());
         assert!(
-            (initial.0 - right_margin).abs() <= 1,
+            (initial.0 - record.allocated_width() - right_margin).abs() <= 1,
             "the track group must be centered"
         );
 
@@ -1199,16 +1272,14 @@ fn gtk_smoke() {
     save_session(&restored);
     assert_eq!(
         read_saved_session().unwrap().paths,
-        vec![broken, good, gone.clone()]
+        vec![broken.clone(), good.clone(), gone.clone()]
     );
 
-    let (child, socket) = Mpv::spawn().unwrap();
-    restored.borrow_mut().mpv = Mpv::connect(child, socket);
-    assert!(restored.borrow().mpv.is_some());
+    start_mpv(&restored, &app);
+    pump_until(|| restored.borrow().mpv.is_some());
     play_index(&restored, 0);
     for _ in 0..30 {
         pump(35);
-        tick_mpv(&restored);
         if restored.borrow().current == Some(1) {
             break;
         }
@@ -1221,15 +1292,13 @@ fn gtk_smoke() {
     play_index(&restored, 2);
     for _ in 0..20 {
         pump(30);
-        tick_mpv(&restored);
-        if !restored.borrow().mpv.as_ref().unwrap().loaded {
+        if !restored.borrow().mpv.as_ref().unwrap().has_track() {
             break;
         }
     }
     std::fs::copy(&restored.borrow().tracks[1].path, &gone).unwrap();
     play_index(&restored, 2);
     pump(300);
-    tick_mpv(&restored);
     next_track(&restored, 1, false);
     assert!(
         restored.borrow().mpv.as_ref().unwrap().loaded,
@@ -1264,6 +1333,39 @@ fn gtk_smoke() {
         .as_deref()
         .unwrap()
         .contains("не найдены"));
+    let short_c = folder.join("quick-c.wav");
+    let short_d = folder.join("quick-d.wav");
+    for path in [&short_c, &short_d] {
+        assert!(std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(&good)
+            .args(["-t", "1.2"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+    {
+        let mut state = restored.borrow_mut();
+        state.tracks = [good, broken, short_c, short_d]
+            .into_iter()
+            .map(preview_track)
+            .collect();
+    }
+    play_index(&restored, 0);
+    play_index(&restored, 1);
+    play_index(&restored, 2);
+    pump_until(|| {
+        let state = restored.borrow();
+        state.current == Some(2) && state.mpv.as_ref().unwrap().loaded
+    });
+    pump_until(|| {
+        let state = restored.borrow();
+        state.current == Some(3) && state.mpv.as_ref().unwrap().loaded
+    });
+    pump_until(|| !restored.borrow().mpv.as_ref().unwrap().has_track());
+    assert!(restored.borrow().failed_tracks.is_empty());
+    shutdown_mpv(&mut restored.borrow_mut());
 }
 
 #[test]

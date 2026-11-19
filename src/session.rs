@@ -31,6 +31,7 @@ pub(crate) struct Appearance {
     pub dynamic_background: bool,
     pub animations: bool,
     pub expanded_sidebar: bool,
+    pub lyrics_seek_hint_seen: bool,
 }
 
 impl Default for Appearance {
@@ -39,6 +40,7 @@ impl Default for Appearance {
             dynamic_background: true,
             animations: true,
             expanded_sidebar: false,
+            lyrics_seek_hint_seen: false,
         }
     }
 }
@@ -197,6 +199,7 @@ mod tests {
                 dynamic_background: false,
                 animations: false,
                 expanded_sidebar: true,
+                lyrics_seek_hint_seen: true,
             },
         };
         write_to(&path, &data).unwrap();
@@ -210,6 +213,7 @@ mod tests {
         assert!(!restored.appearance.dynamic_background);
         assert!(!restored.appearance.animations);
         assert!(restored.appearance.expanded_sidebar);
+        assert!(restored.appearance.lyrics_seek_hint_seen);
         assert!(restored.online_covers);
         assert!((restored.volume - 62.0).abs() < f64::EPSILON);
         assert!((restored.speed - 1.25).abs() < f64::EPSILON);

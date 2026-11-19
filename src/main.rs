@@ -23,10 +23,11 @@ mod shuffle;
 mod theme;
 mod track_menu;
 mod ui_updates;
+mod vinyl;
 mod yandex_export;
 use library::{collect_audio, extract_cover, preview_track, read_track};
 use lyrics::online_lyrics;
-use mpv::Mpv;
+use mpv::{Mpv, MpvProcess, ReadReady};
 use session::{Appearance, Session};
 use shuffle::ShuffleOrder;
 use ui_updates::UiUpdates;
@@ -75,6 +76,7 @@ struct Model {
     imports_pending: usize,
     failed_tracks: std::collections::HashSet<usize>,
     mpv: Option<Mpv>,
+    mpv_process: Option<MpvProcess>,
 }
 
 fn request_ui(model: &Rc<RefCell<Model>>) {
@@ -133,6 +135,7 @@ fn build_ui(app: &gtk::Application) {
         imports_pending: 0,
         failed_tracks: Default::default(),
         mpv: None,
+        mpv_process: None,
     }));
     restore_session(&model);
     let appearance = model.borrow().appearance;
@@ -236,13 +239,13 @@ fn build_ui(app: &gtk::Application) {
     subheading.set_margin_bottom(10);
     content.pack_start(&header, false, false, 0);
 
-    let (player_page, _) = now_playing::build(&model);
+    let (player_page, player_views) = now_playing::build(&model);
     let (queue_page, queue_search) = build_queue_page(&model);
     pages.add_named(&player_page, "Плеер");
     pages.add_named(&queue_page, "Очередь");
     pages.add_named(&build_settings_page(&model, &sidebar), "Настройки");
     content.pack_start(&pages, true, true, 0);
-    let controls = playback_controls::build(&model);
+    let controls = playback_controls::build(&model, &pages, &player_views);
 
     let main_column = gtk::Box::new(gtk::Orientation::Vertical, 12);
     main_column.pack_start(&content, true, true, 0);
@@ -317,6 +320,8 @@ fn build_ui(app: &gtk::Application) {
         glib::Propagation::Proceed
     });
 
+    let model_destroy = model.clone();
+    window.connect_destroy(move |_| shutdown_mpv(&mut model_destroy.borrow_mut()));
     let buttons_lifetime = page_buttons.clone();
     window.connect_destroy(move |_| buttons_lifetime.borrow_mut().clear());
     let model_count = model.clone();
@@ -336,16 +341,7 @@ fn build_ui(app: &gtk::Application) {
             subheading_update.set_visible(!text.is_empty());
         }
     });
-    updates.listen(&window, {
-        let model = Rc::downgrade(&model);
-        move || {
-            if let Some(model) = model.upgrade() {
-                arm_mpv_writes(&model);
-            }
-        }
-    });
-
-    start_mpv(&model);
+    start_mpv(&model, app);
 
     sync_stack_motion(window.upcast_ref());
     motion::animate_buttons(window.upcast_ref());
@@ -485,6 +481,7 @@ fn crossfade_cover(
 }
 
 fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Widget {
+    const SEEK_HINT: &str = "Двойной щелчок по строке — перейти к этому моменту";
     let overlay = gtk::Overlay::new();
     overlay.style_context().add_class("lyrics-overlay");
 
@@ -546,11 +543,13 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
     let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
     page.set_margin_top(16);
     page.set_margin_bottom(16);
-    page.set_margin_start(28);
-    page.set_margin_end(28);
+    page.set_margin_start(12);
+    page.set_margin_end(12);
     overlay.add_overlay(&page);
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    header.set_margin_start(12);
+    header.set_margin_end(12);
     let back = icon_button("go-previous-symbolic", "К плееру", "icon-button");
     back.style_context().add_class("lyrics-back");
     back.set_valign(gtk::Align::Center);
@@ -598,6 +597,10 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
     empty.set_max_width_chars(46);
     empty.style_context().add_class("empty-state");
     empty_box.pack_start(&empty, false, false, 0);
+    let search_note = gtk::Label::new(Some("Можно добавить файл .lrc рядом с аудиофайлом."));
+    search_note.style_context().add_class("lyrics-hint");
+    search_note.set_line_wrap(true);
+    empty_box.pack_start(&search_note, false, false, 0);
     body.add_named(&empty_box, "empty");
 
     let lyrics_list = gtk::ListBox::new();
@@ -618,17 +621,40 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
     lyrics_scroll.set_shadow_type(gtk::ShadowType::None);
     lyrics_scroll.style_context().add_class("lyrics-scroll");
     lyrics_scroll.add(&content);
+    content.connect_size_allocate({
+        let list = lyrics_list.downgrade();
+        move |_, allocation| {
+            if let Some(list) = list.upgrade() {
+                let extra = (allocation.width() - 900).max(0);
+                let start = extra / 2;
+                let end = extra - start;
+                if (list.margin_start(), list.margin_end()) != (start, end) {
+                    list.set_margin_start(start);
+                    list.set_margin_end(end);
+                }
+            }
+        }
+    });
 
     body.add_named(&lyrics_scroll, "list");
     body.set_visible_child_name("empty");
     page.pack_start(&body, true, true, 0);
 
-    let hint = gtk::Label::new(Some("Текст песни"));
+    let hint = gtk::Label::new(Some(SEEK_HINT));
     hint.set_xalign(0.5);
     hint.set_line_wrap(true);
     hint.set_justify(gtk::Justification::Center);
     hint.style_context().add_class("lyrics-hint");
-    page.pack_start(&hint, false, false, 0);
+    hint.set_no_show_all(true);
+    hint.set_halign(gtk::Align::Center);
+    hint.set_valign(gtk::Align::End);
+    hint.set_margin_bottom(12);
+    overlay.add_overlay(&hint);
+    overlay.set_overlay_pass_through(&hint, true);
+    overlay.connect_unmap({
+        let hint = hint.clone();
+        move |_| hint.hide()
+    });
 
     let views_back = views.downgrade();
     back.connect_clicked(move |_| {
@@ -748,7 +774,6 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
     let lyrics_adjustment = lyrics_scroll.vadjustment();
     let label_update = empty.clone();
     let body_update = body.clone();
-    let hint_update = hint.clone();
     let title_update = lyrics_title.clone();
     let artist_update = lyrics_artist.clone();
     let backdrop_update = backdrop.clone();
@@ -771,6 +796,25 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
     updates.listen(&overlay, move || {
         if !lyrics_view.upgrade().is_some_and(|view| view.is_mapped()) {
             return;
+        }
+        let show_hint = {
+            let state = model_update.borrow();
+            !state.appearance.lyrics_seek_hint_seen
+                && state
+                    .current
+                    .and_then(|i| state.tracks.get(i))
+                    .is_some_and(|track| track.lyrics.iter().any(|line| line.time.is_some()))
+        };
+        if show_hint {
+            model_update.borrow_mut().appearance.lyrics_seek_hint_seen = true;
+            save_session(&model_update);
+            hint.show();
+            let hint = hint.downgrade();
+            glib::timeout_add_local_once(Duration::from_secs(5), move || {
+                if let Some(hint) = hint.upgrade() {
+                    hint.hide();
+                }
+            });
         }
         let state = model_update.borrow();
         if dynamic_background != state.appearance.dynamic_background {
@@ -821,7 +865,7 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
                         } else {
                             status.3.unwrap_or("Готовим поиск текста…")
                         });
-                        hint_update.set_text("Текст ищется автоматически в LRCLIB. Можно добавить .lrc рядом с аудиофайлом.");
+                        hint.hide();
                     }
                     body_update.set_visible_child_name(if status.0 { "empty" } else { "list" });
                 }
@@ -872,13 +916,9 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
                     );
                     lyric_times.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
                     synchronized = !lyric_times.is_empty();
-                    hint_update.set_text(if synchronized {
-                        "Двойной щелчок по строке — перейти к этому моменту"
-                    } else if track.lyrics.is_empty() {
-                        "Текст ищется автоматически в LRCLIB. Можно добавить .lrc рядом с аудиофайлом."
-                    } else {
-                        "Этот текст без временных меток — листай в своём темпе."
-                    });
+                    if !synchronized {
+                        hint.hide();
+                    }
                     for child in list_update.children() {
                         list_update.remove(&child);
                     }
@@ -891,8 +931,11 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
                         text.set_justify(gtk::Justification::Left);
                         text.set_margin_top(12);
                         text.set_margin_bottom(12);
-                        text.set_margin_start(24);
-                        text.set_margin_end(24);
+                        text.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
+                        text.set_halign(gtk::Align::Start);
+                        if line.time.is_some() {
+                            row.set_tooltip_text(Some(SEEK_HINT));
+                        }
                         text.style_context().add_class("lyric-text");
                         if !synchronized {
                             text.style_context().add_class("lyric-plain");
@@ -994,7 +1037,7 @@ fn build_lyrics_view(model: &Rc<RefCell<Model>>, views: &gtk::Stack) -> gtk::Wid
                 artist_update.set_text("Выбери трек");
                 rendered_labels = None;
                 label_update.set_text("Выбери трек");
-                hint_update.set_text("");
+                hint.hide();
                 body_update.set_visible_child_name("empty");
             }
             if rendered_cover.take().is_some() {
@@ -1377,7 +1420,10 @@ fn edit_queue(model: &Rc<RefCell<Model>>, path: &Path, action: QueueEdit<'_>) ->
         current.and_then(|path| state.tracks.iter().position(|track| track.path == path));
     let removed_current = state.current.is_none() && matches!(action, QueueEdit::Remove);
     let continue_at = (removed_current
-        && state.mpv.as_ref().is_some_and(|p| p.loaded && !p.paused))
+        && state
+            .mpv
+            .as_ref()
+            .is_some_and(|p| p.has_track() && !p.paused))
     .then(|| index.min(state.tracks.len().saturating_sub(1)))
     .filter(|_| !state.tracks.is_empty());
     state.library_revision += 1;
@@ -1964,131 +2010,136 @@ fn build_queue_page(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::SearchEntr
     (page.upcast(), search)
 }
 
-fn start_mpv(model: &Rc<RefCell<Model>>) {
+fn start_mpv(model: &Rc<RefCell<Model>>, app: &gtk::Application) {
+    const START_ERROR: &str = "Не удалось запустить mpv. Проверь, что он установлен.";
     request_ui(model);
-    let Some((child, path)) = Mpv::spawn() else {
-        model.borrow_mut().status =
-            Some("Не удалось запустить mpv. Проверь, что он установлен.".into());
+    let Some(process) = MpvProcess::spawn(Some(app.upcast_ref())) else {
+        model.borrow_mut().status = Some(START_ERROR.into());
         return;
     };
-    let task = gtk::gio::spawn_blocking(move || Mpv::connect(child, path));
+    let task = process.connect_task();
+    model.borrow_mut().mpv_process = Some(process);
     let model = Rc::downgrade(model);
     glib::MainContext::default().spawn_local(async move {
         let connected = task.await.ok().flatten();
         let Some(model) = model.upgrade() else { return };
-        match connected {
-            Some(mut player) => {
-                let mut state = model.borrow_mut();
-                let _ = player.set_volume(state.volume);
-                let _ = player.set_muted(state.muted);
-                let _ = player.command(json!(["set_property", "speed", state.speed]));
-                let _ = player.command(json!([
-                    "set_property",
-                    "loop-file",
-                    if state.repeat == 2 { "inf" } else { "no" }
-                ]));
-                let events_model = Rc::downgrade(&model);
-                player.event_source = Some(glib::unix_fd_add_local(
-                    player.socket_fd(),
-                    glib::IOCondition::IN | glib::IOCondition::HUP | glib::IOCondition::ERR,
-                    move |_, _| {
-                        if let Some(model) = events_model.upgrade() {
-                            tick_mpv(&model);
-                        }
-                        glib::ControlFlow::Continue
-                    },
-                ));
-                state.mpv = Some(player);
-                state.updates.request();
-            }
-            None => {
-                let mut state = model.borrow_mut();
-                state.status = Some("Не удалось запустить mpv. Проверь, что он установлен.".into());
-                state.updates.request();
-            }
+        let mut state = model.borrow_mut();
+        if state.mpv_process.is_none() {
+            // The window was destroyed while the connection was being established.
+            return;
+        }
+        if let Some(socket) = connected {
+            let mut player = Mpv::new(socket);
+            watch_mpv(&mut player, &model);
+            player.observe();
+            let _ = player.set_volume(state.volume);
+            let _ = player.set_muted(state.muted);
+            let _ = player.command(json!(["set_property", "speed", state.speed]));
+            let _ = player.command(json!([
+                "set_property",
+                "loop-file",
+                if state.repeat == 2 { "inf" } else { "no" }
+            ]));
+            state.mpv = Some(player);
+        } else {
+            shutdown_mpv(&mut state);
+            state.status = Some(START_ERROR.into());
+        }
+        state.updates.request();
+    });
+}
+
+fn shutdown_mpv(state: &mut Model) {
+    state.mpv.take();
+    state.mpv_process.take();
+}
+
+fn watch_mpv(player: &mut Mpv, model: &Rc<RefCell<Model>>) {
+    let model = Rc::downgrade(model);
+    player.watch(move |condition, output| {
+        let Some(model) = model.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if output {
+            model
+                .borrow_mut()
+                .mpv
+                .as_mut()
+                .map_or(glib::ControlFlow::Break, |player| {
+                    player.write_ready(condition)
+                })
+        } else {
+            tick_mpv(&model, condition)
         }
     });
 }
 
-fn arm_mpv_writes(model: &Rc<RefCell<Model>>) {
-    let mut state = model.borrow_mut();
-    let Some(player) = state
-        .mpv
-        .as_mut()
-        .filter(|p| p.has_outgoing() && p.write_source.is_none())
-    else {
-        return;
-    };
-    let model = Rc::downgrade(model);
-    player.write_source = Some(glib::unix_fd_add_local(
-        player.socket_fd(),
-        glib::IOCondition::OUT,
-        move |_, _| {
-            let Some(model) = model.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            tick_mpv(&model);
-            if let Some(player) = model.borrow_mut().mpv.as_mut() {
-                if player.has_outgoing() {
-                    return glib::ControlFlow::Continue;
-                }
-                player.write_source.take();
-            }
-            glib::ControlFlow::Break
-        },
-    ));
-}
-
-fn tick_mpv(model: &Rc<RefCell<Model>>) {
+fn tick_mpv(model: &Rc<RefCell<Model>>, condition: glib::IOCondition) -> glib::ControlFlow {
     let (ended, failed) = {
         let mut state = model.borrow_mut();
-        state.updates.request_progress();
         let Some(player) = state.mpv.as_mut() else {
-            return;
+            return glib::ControlFlow::Break;
         };
-        if let Err(error) = player.read_events() {
-            state.mpv = None;
-            state.status = Some(format!(
-                "Связь с mpv прервалась: {error}. Перезапусти плеер."
-            ));
-            return;
-        }
+        let outcome = player.read_ready(condition);
         let volume = player.volume.take();
         let muted = player.muted.take();
-        let ended = std::mem::take(&mut player.ended);
-        let failed = std::mem::take(&mut player.failed);
-        if let Some(error) = player.error.take() {
-            state.status = Some(error);
-        }
+        // HUP can accompany readable data. Keep the playback result until the
+        // socket is drained, without asking a disconnected mpv to load.
+        let (ended, failed, command_error) = if matches!(outcome, ReadReady::Closing) {
+            (false, false, None)
+        } else {
+            (
+                std::mem::take(&mut player.ended),
+                std::mem::take(&mut player.failed),
+                player.error.take(),
+            )
+        };
         if let Some(volume) = volume {
             state.volume = volume.clamp(0.0, 100.0);
         }
         if let Some(muted) = muted {
             state.muted = muted;
         }
+        if failed {
+            if let Some(current) = state.current {
+                state.failed_tracks.insert(current);
+            }
+        } else if ended {
+            state.failed_tracks.clear();
+        }
+        if let ReadReady::Disconnected(error) = outcome {
+            shutdown_mpv(&mut state);
+            let status = format!("Связь с mpv прервалась: {error}. Перезапусти плеер.");
+            state.status = Some(match command_error {
+                Some(message) => format!("{message} {status}"),
+                None => status,
+            });
+            state.updates.request();
+            return glib::ControlFlow::Break;
+        }
+        if let Some(error) = command_error {
+            state.status = Some(error);
+            state.updates.request();
+        } else {
+            state.updates.request_progress();
+        }
         (ended, failed)
     };
     if failed {
-        let mut state = model.borrow_mut();
-        if let Some(current) = state.current {
-            state.failed_tracks.insert(current);
-            let next = advance_index(&mut state, 1, true);
-            drop(state);
-            if let Some(next) = next {
-                load_index(model, next);
-                let mut state = model.borrow_mut();
-                if state.status.is_none() {
-                    state.status = Some(
-                        "Не удалось воспроизвести предыдущий файл. Перешли к следующему треку."
-                            .into(),
-                    );
-                }
+        let next = advance_index(&mut model.borrow_mut(), 1, true);
+        if let Some(next) = next {
+            load_index(model, next);
+            let mut state = model.borrow_mut();
+            if state.status.is_none() {
+                state.status = Some(
+                    "Не удалось воспроизвести предыдущий файл. Перешли к следующему треку.".into(),
+                );
             }
         }
     } else if ended {
-        model.borrow_mut().failed_tracks.clear();
         next_track(model, 1, true);
     }
+    glib::ControlFlow::Continue
 }
 
 fn play_index(model: &Rc<RefCell<Model>>, index: usize) {
@@ -2115,17 +2166,7 @@ fn load_index(model: &Rc<RefCell<Model>>, index: usize) {
     };
     state.status = None;
     if let Some(player) = state.mpv.as_mut() {
-        if player
-            .command(json!(["loadfile", mpv_path, "replace"]))
-            .is_ok()
-        {
-            player.generation = player.generation.wrapping_add(1);
-            player.set_position(0.0);
-            player.duration = 0.0;
-            player.ended = false;
-            player.paused = false;
-            player.loaded = true;
-        } else {
+        if player.load(mpv_path).is_err() {
             state.status = Some("Не удалось передать трек в mpv. Перезапусти плеер.".into());
             return;
         }
@@ -2250,10 +2291,6 @@ fn stop_playback(model: &Rc<RefCell<Model>>) {
     state.updates.request();
     if let Some(player) = state.mpv.as_mut() {
         let _ = player.command(json!(["stop"]));
-        player.paused = true;
-        player.loaded = false;
-        player.set_position(0.0);
-        player.duration = 0.0;
     }
 }
 

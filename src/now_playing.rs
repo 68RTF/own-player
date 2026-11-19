@@ -41,7 +41,12 @@ pub(super) fn build(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::Stack) {
     cover_stack.add_named(&picture, "image-alt");
     cover_stack.set_visible_child_name("placeholder");
     cover_frame.pack_start(&cover_stack, true, true, 0);
-    hero.pack_start(&cover_frame, false, false, 0);
+    let sleeve = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let record = vinyl::build(model);
+    record.set_valign(gtk::Align::Center);
+    sleeve.pack_start(&record, false, false, 0);
+    sleeve.pack_start(&cover_frame, false, false, 0);
+    hero.pack_start(&sleeve, false, false, 0);
 
     let details = gtk::Box::new(gtk::Orientation::Vertical, 4);
     details.set_valign(gtk::Align::Center);
@@ -155,9 +160,14 @@ pub(super) fn build(model: &Rc<RefCell<Model>>) -> (gtk::Widget, gtk::Stack) {
             let compact = width < 680 || height < 370;
             let spacing = if compact { 16 } else { 32 };
             let details_width = (width * 2 / 5).clamp(180, 360);
-            let edge = (width - details_width - spacing - 32)
-                .min(height - 44)
-                .clamp(112, 376);
+            let available = width - details_width - spacing - 32;
+            let reveal_ratio = if compact { 0.20 } else { 0.33 };
+            let edge = (f64::from(available) / (1.0 + reveal_ratio)) as i32;
+            let edge = edge.min(height - 44).clamp(112, 376);
+            let reveal = (f64::from(edge) * reveal_ratio).round() as i32;
+            if record.width_request() != reveal || record.height_request() != edge {
+                record.set_size_request(reveal, edge);
+            }
             if cover.width_request() != edge {
                 cover.set_size_request(edge, edge);
             }
