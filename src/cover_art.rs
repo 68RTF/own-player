@@ -1,13 +1,23 @@
 use crate::Track;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 static ALBUM_DOWNLOADS: [Mutex<()>; 32] = [const { Mutex::new(()) }; 32];
+static ALBUM_INDEX: Mutex<Option<AlbumIndex>> = Mutex::new(None);
+
+struct AlbumIndex {
+    path: PathBuf,
+    modified: SystemTime,
+    len: u64,
+    albums: HashMap<(String, String), String>,
+}
 
 fn data_root() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
@@ -51,12 +61,14 @@ pub(crate) fn install_index(source: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
     fs::rename(&temporary, &target).map_err(|error| error.to_string())?;
+    if let Ok(mut index) = ALBUM_INDEX.lock() {
+        *index = None;
+    }
     Ok(())
 }
 
 pub(crate) fn online_cover(track: &Track) -> Option<PathBuf> {
-    let content = fs::read_to_string(index_path()?).ok()?;
-    let album_id = find_album_id(&content, &track.title, &track.artist)?;
+    let album_id = album_for_track(&track.title, &track.artist)?;
     let root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
@@ -139,23 +151,46 @@ fn normalize(value: &str) -> String {
         .collect()
 }
 
-fn find_album_id(csv: &str, title: &str, artist: &str) -> Option<String> {
-    let wanted_title = normalize(title);
-    let wanted_artist = normalize(artist);
-    if wanted_title.is_empty() || wanted_artist.is_empty() {
+fn album_for_track(title: &str, artist: &str) -> Option<String> {
+    let key = (normalize(title), normalize(artist));
+    if key.0.is_empty() || key.1.is_empty() {
         return None;
     }
-    parse_csv(csv).into_iter().skip(1).find_map(|row| {
-        if row.len() < 7
-            || normalize(&row[1]) != wanted_title
-            || normalize(&row[2]) != wanted_artist
-        {
-            return None;
-        }
+    let path = index_path()?;
+    let mut cached = ALBUM_INDEX.lock().ok()?;
+    let metadata = fs::metadata(&path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let len = metadata.len();
+    if cached
+        .as_ref()
+        .is_none_or(|index| index.path != path || index.modified != modified || index.len != len)
+    {
+        let csv = fs::read_to_string(&path).ok()?;
+        *cached = Some(AlbumIndex {
+            path,
+            modified,
+            len,
+            albums: index_albums(&csv),
+        });
+    }
+    cached.as_ref()?.albums.get(&key).cloned()
+}
+
+fn index_albums(csv: &str) -> HashMap<(String, String), String> {
+    let mut albums = HashMap::new();
+    for row in parse_csv(csv)
+        .into_iter()
+        .skip(1)
+        .filter(|row| row.len() >= 7)
+    {
         let id = row[6].trim();
-        (id.len() <= 20 && !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
-            .then(|| id.to_string())
-    })
+        if id.len() <= 20 && !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+            albums
+                .entry((normalize(&row[1]), normalize(&row[2])))
+                .or_insert_with(|| id.to_string());
+        }
+    }
+    albums
 }
 
 fn parse_csv(input: &str) -> Vec<Vec<String>> {
@@ -193,15 +228,21 @@ fn parse_csv(input: &str) -> Vec<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_album_id, parse_csv};
+    use super::{index_albums, normalize, parse_csv};
 
     #[test]
     fn csv_handles_quoted_fields_and_matches_album() {
         let csv = "position,title,artists,album,duration,track_id,album_id,url\n1,Song,Artist,Album,200,1,42,url\n2,\"Other, Song\",\"A, B\",Album,180,2,43,url\n";
         assert_eq!(parse_csv(csv).len(), 3);
-        assert_eq!(find_album_id(csv, "Song", "Artist"), Some("42".into()));
-        assert_eq!(find_album_id(csv, "Other, Song", "A, B"), Some("43".into()));
-        assert_eq!(find_album_id(csv, "Song", "Different"), None);
+        let albums = index_albums(csv);
+        let find = |title, artist| {
+            albums
+                .get(&(normalize(title), normalize(artist)))
+                .map(String::as_str)
+        };
+        assert_eq!(find("Song", "Artist"), Some("42"));
+        assert_eq!(find("Other, Song", "A, B"), Some("43"));
+        assert_eq!(find("Song", "Different"), None);
     }
 
     #[test]

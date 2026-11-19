@@ -35,7 +35,6 @@ Priority: optional
 Architecture: $arch
 Maintainer: 68RTF
 Depends: libgtk-3-0t64, mpv, ffmpeg, curl
-Recommends: libsecret-tools
 Conflicts: own-player
 Description: Local music player for Linux
  Local audio player with a queue, lyrics and optional online artwork.

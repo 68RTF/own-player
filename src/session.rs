@@ -3,9 +3,14 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, OnceLock};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Session {
+    #[serde(default)]
+    pub appearance: Appearance,
+    #[serde(default)]
+    pub muted: bool,
     pub paths: Vec<PathBuf>,
     pub current_path: Option<PathBuf>,
     #[serde(default)]
@@ -18,8 +23,26 @@ pub(crate) struct Session {
     pub volume: f64,
     #[serde(default = "default_speed")]
     pub speed: f64,
-    #[serde(default)]
-    pub soundcloud_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct Appearance {
+    pub dynamic_background: bool,
+    pub animations: bool,
+    pub expanded_sidebar: bool,
+    pub lyrics_seek_hint_seen: bool,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            dynamic_background: true,
+            animations: true,
+            expanded_sidebar: false,
+            lyrics_seek_hint_seen: false,
+        }
+    }
 }
 
 fn default_online_covers() -> bool {
@@ -37,6 +60,8 @@ fn default_speed() -> f64 {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            appearance: Appearance::default(),
+            muted: false,
             paths: Vec::new(),
             current_path: None,
             play_next: None,
@@ -45,7 +70,6 @@ impl Default for Session {
             online_covers: true,
             volume: default_volume(),
             speed: default_speed(),
-            soundcloud_dir: None,
         }
     }
 }
@@ -65,10 +89,60 @@ pub(crate) fn load() -> io::Result<Session> {
     read_from(&path)
 }
 
-pub(crate) fn save(session: &Session) -> io::Result<()> {
+enum WriteRequest {
+    Save(PathBuf, Session),
+    Flush(mpsc::Sender<()>),
+}
+
+static WRITER: OnceLock<mpsc::Sender<WriteRequest>> = OnceLock::new();
+
+pub(crate) fn save(session: Session) -> io::Result<()> {
     let path = location()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Не найден домашний каталог"))?;
-    write_to(&path, session)
+    let sender = WRITER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || write_sessions(&receiver));
+        sender
+    });
+    sender
+        .send(WriteRequest::Save(path, session))
+        .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))
+}
+
+pub(crate) fn flush() {
+    if let Some(writer) = WRITER.get() {
+        let (sender, receiver) = mpsc::channel();
+        if writer.send(WriteRequest::Flush(sender)).is_ok() {
+            let _ = receiver.recv();
+        }
+    }
+}
+
+fn write_sessions(receiver: &mpsc::Receiver<WriteRequest>) {
+    let mut next = None;
+    while let Some(request) = next.take().or_else(|| receiver.recv().ok()) {
+        match request {
+            WriteRequest::Save(path, mut session) => {
+                while let Ok(request) = receiver.try_recv() {
+                    match request {
+                        WriteRequest::Save(new_path, new_session) if new_path == path => {
+                            session = new_session;
+                        }
+                        other => {
+                            next = Some(other);
+                            break;
+                        }
+                    }
+                }
+                if let Err(error) = write_to(&path, &session) {
+                    eprintln!("Не удалось сохранить очередь: {error}");
+                }
+            }
+            WriteRequest::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
 }
 
 fn read_from(path: &Path) -> io::Result<Session> {
@@ -120,7 +194,13 @@ mod tests {
             online_covers: true,
             volume: 62.0,
             speed: 1.25,
-            soundcloud_dir: Some(PathBuf::from("/music/SoundCloud")),
+            muted: true,
+            appearance: super::Appearance {
+                dynamic_background: false,
+                animations: false,
+                expanded_sidebar: true,
+                lyrics_seek_hint_seen: true,
+            },
         };
         write_to(&path, &data).unwrap();
         let restored = read_from(&path).unwrap();
@@ -129,11 +209,31 @@ mod tests {
         assert_eq!(restored.play_next, data.play_next);
         assert!(restored.shuffle);
         assert_eq!(restored.repeat, 2);
+        assert!(restored.muted);
+        assert!(!restored.appearance.dynamic_background);
+        assert!(!restored.appearance.animations);
+        assert!(restored.appearance.expanded_sidebar);
+        assert!(restored.appearance.lyrics_seek_hint_seen);
         assert!(restored.online_covers);
         assert!((restored.volume - 62.0).abs() < f64::EPSILON);
         assert!((restored.speed - 1.25).abs() < f64::EPSILON);
-        assert_eq!(restored.soundcloud_dir, data.soundcloud_dir);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn reads_queues_saved_with_download_settings() {
+        let old = r#"{"paths":["/music/song.mp3"],"current_path":"/music/song.mp3","shuffle":false,"repeat":0,"soundcloud_dir":"/music/downloads"}"#;
+        let restored: Session = serde_json::from_str(old).unwrap();
+
+        assert_eq!(restored.paths, [PathBuf::from("/music/song.mp3")]);
+        assert_eq!(
+            restored.current_path,
+            Some(PathBuf::from("/music/song.mp3"))
+        );
+        assert!(serde_json::to_value(restored)
+            .unwrap()
+            .get("soundcloud_dir")
+            .is_none());
     }
 
     #[test]
@@ -143,6 +243,5 @@ mod tests {
         assert!(restored.online_covers);
         assert!((restored.volume - 75.0).abs() < f64::EPSILON);
         assert!((restored.speed - 1.0).abs() < f64::EPSILON);
-        assert_eq!(restored.soundcloud_dir, None);
     }
 }

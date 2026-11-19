@@ -4,9 +4,10 @@ cd "$(dirname "$0")/.."
 fixture=$(mktemp -d /tmp/own-player-ui.XXXXXX)
 trap 'rm -rf "$fixture"' EXIT
 export GDK_BACKEND=x11
+export GTK_THEME="${GTK_THEME:-Adwaita:dark}"
 export XDG_DATA_HOME="$fixture/data"
 export XDG_CACHE_HOME="$fixture/cache"
-export OWN_PLAYER_SCREENSHOTS="$(pwd)/artifacts/ui"
+export OWN_PLAYER_SCREENSHOTS="${OWN_PLAYER_SCREENSHOTS:-$(pwd)/artifacts/ui}"
 mkdir -p "$XDG_DATA_HOME/own-player" "$OWN_PLAYER_SCREENSHOTS"
 # Deterministic LRCLIB fixture: UI tests never send requests to the internet.
 mkdir -p "$fixture/bin"
@@ -42,4 +43,4 @@ for name in ['Тихий океан - Медленный свет', 'Втора�
     tracks.append(str(path))
 (root / 'data/own-player/session.json').write_text(json.dumps(dict(paths=tracks, current_path=track, shuffle=False, repeat=0, online_covers=False, volume=0, speed=1)))
 PY
-xvfb-run -e /tmp/own-player-xvfb.log -a -s '-screen 0 1160x780x24' cargo test --offline gtk_smoke -- --ignored --test-threads=1 --nocapture
+xvfb-run -e "$fixture/xvfb.log" -a -s "-screen 0 ${OWN_PLAYER_XVFB_SCREEN:-1920x1080x24}" cargo test --offline gtk_smoke -- --ignored --test-threads=1 --nocapture

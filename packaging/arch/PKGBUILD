@@ -1,13 +1,12 @@
 # Maintainer: 68RTF
 pkgname=veyra
-pkgver=0.7.0
+pkgver=0.8.0
 pkgrel=1
 pkgdesc='Local GTK music player powered by mpv'
 arch=('x86_64' 'aarch64')
 url='https://github.com/68RTF/veyra'
 depends=('gtk3' 'mpv' 'ffmpeg' 'curl')
 conflicts=('own-player')
-optdepends=('libsecret: save SoundCloud token in the keyring')
 makedepends=('cargo' 'pkgconf')
 options=('!debug')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
